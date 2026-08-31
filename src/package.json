@@ -1,0 +1,45 @@
+{
+  "name": "tokenmonitor",
+  "productName": "TokenMonitor",
+  "version": "1.3.0",
+  "type": "module",
+  "description": "TokenMonitor - Multi-Provider AI Token & Quota Monitor",
+  "author": "TokenMonitor",
+  "main": "dist-electron/main/index.js",
+  "scripts": {
+    "dev": "vite",
+    "app": "node scripts/dev-app.cjs",
+    "start": "node scripts/dev-app.cjs",
+    "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit && vite build",
+    "build:dir": "npm run build && electron-builder --win dir",
+    "build:installer": "npm run build && electron-builder --win nsis",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.4.7",
+    "lucide-react": "^1.16.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sql.js": "^1.14.2",
+    "tailwind-merge": "^3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.1",
+    "vite-plugin-electron": "^0.29.0",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  }
+}

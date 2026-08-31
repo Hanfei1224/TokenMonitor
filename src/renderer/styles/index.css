@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark light;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: transparent !important;
+  user-select: none;
+  -webkit-user-drag: none;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Segoe UI', Roboto, 'PingFang SC', sans-serif;
+}
+
+/* Apple 风格纯净半透明 Acrylic 磨砂 */
+.glass-panel-pure {
+  background: rgba(28, 28, 30, 0.72);
+  backdrop-filter: blur(28px) saturate(180%);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+}
+.glass-card-pure {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.glass-button-pure {
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.glass-button-pure:hover {
+  background: rgba(255, 255, 255, 0.18);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+
+.glass-button-pure:active {
+  transform: scale(0.97);
+}
+
+/* 窗口拖拽区域 */
+.app-drag-region {
+  -webkit-app-region: drag;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.cal-day {
+  transform: translateZ(0);
+  transition: transform 0.16s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.cal-day:hover {
+  transform: translateZ(0) scale(1.08);
+}

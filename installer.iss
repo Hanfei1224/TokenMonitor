@@ -1,19 +1,19 @@
 ; OpencodeMonitor — Inno Setup 安装脚本
-#define MyAppName "OpencodeMonitor"
-#define MyAppExeName "OpencodeMonitor.exe"
-#define MyAppVersion "1.2.1"
+#define MyAppName "TokenMonitor"
+#define MyAppExeName "TokenMonitor.exe"
+#define MyAppVersion "1.3.0"
 
 [Setup]
 AppId={{8E9F3B2C-5A11-4D27-9C6B-4A1E2F3C4D5E}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher=OpenCode Monitor
-DefaultDirName={localappdata}\Programs\OpencodeMonitor
+AppPublisher=TokenMonitor
+DefaultDirName={localappdata}\Programs\TokenMonitor
 DefaultGroupName={#MyAppName}
 DisableDirPage=yes
 UsePreviousAppDir=yes
 DisableProgramGroupPage=yes
-OutputBaseFilename=OpencodeMonitor-Setup-{#MyAppVersion}
+OutputBaseFilename=TokenMonitor-Setup-{#MyAppVersion}
 OutputDir=installer
 Compression=lzma2
 SolidCompression=yes

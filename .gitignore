@@ -1,10 +1,15 @@
 # ===== 敏感文件：严禁提交 =====
 # 用户配置（含 OpenCode API Key）
 config.json
+stats_cache.json
+deepseek_daily.json
 
 # ===== 构建产物 =====
 dist/
 build/
+node_modules/
+dist-electron/
+release/
 __pycache__/
 *.pyc
 *.pyo
@@ -17,8 +22,13 @@ installer/*.exe.manifest
 .tmp/
 .opencode/
 .superpowers/
+.vite/
 *.log
 *.bak.json
+startup.log
+启动日志.txt
+src/test-run.mjs
+src/test_claude.cjs
 
 # ===== 系统 =====
 .DS_Store

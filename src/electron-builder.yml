@@ -1,0 +1,30 @@
+appId: com.token.monitor
+productName: TokenMonitor
+directories:
+  output: ../release
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+  - icon.ico
+  - icon.png
+asarUnpack:
+  - node_modules/better-sqlite3/**
+  - dist-electron/main/sql-wasm.wasm
+win:
+  executableName: TokenMonitor
+  target:
+    - target: dir
+      arch:
+        - x64
+    - target: nsis
+      arch:
+        - x64
+  icon: icon.ico
+nsis:
+  shortcutName: TokenMonitor
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  perMachine: false

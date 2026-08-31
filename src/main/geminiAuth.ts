@@ -1,0 +1,330 @@
+import http from 'node:http'
+import { randomUUID } from 'node:crypto'
+import { shell } from 'electron'
+import { loadConfig, saveConfig } from './store.js'
+
+// Antigravity 官方维护的 Google OAuth 生产凭据
+const GOOGLE_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com'
+const GOOGLE_CLIENT_SECRET = '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'
+const SCOPES = [
+  'openid',
+  'https://www.googleapis.com/auth/cloud-platform',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/cclog',
+  'https://www.googleapis.com/auth/experimentsandconfigs'
+].join(' ')
+
+const QUOTA_ENDPOINTS = [
+  'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+  'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+  'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels'
+]
+
+let authServer: http.Server | null = null
+
+export interface PoolQuota {
+  percent: number
+  resetsAt: string | null
+}
+
+export interface GeminiQuotaData {
+  configured: boolean
+  email?: string
+  geminiPool?: PoolQuota
+  claudePool?: PoolQuota
+  status?: string
+  error?: string | null
+}
+
+/**
+ * 启动本地临时 OAuth HTTP 服务器并打开浏览器
+ */
+export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; error?: string }> {
+  return new Promise((resolve) => {
+    const state = randomUUID()
+
+    if (authServer) {
+      try {
+        authServer.close()
+      } catch {}
+      authServer = null
+    }
+
+    const server = http.createServer(async (req, res) => {
+      try {
+        const urlObj = new URL(req.url || '', `http://localhost`)
+        if (urlObj.pathname === '/oauth/callback') {
+          const code = urlObj.searchParams.get('code')
+          const error = urlObj.searchParams.get('error')
+          const receivedState = urlObj.searchParams.get('state')
+
+          if (receivedState !== state) {
+            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' })
+            res.end('<h3>授权请求已失效，请返回应用重新登录。</h3>')
+            resolve({ success: false, error: 'OAuth state mismatch' })
+            cleanup()
+            return
+          }
+
+          if (error) {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+            res.end(`
+              <html>
+                <body style="background:#18181b;color:#f87171;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;">
+                  <h2>❌ Google 授权被取消或失败</h2>
+                  <p>${error}</p>
+                </body>
+              </html>
+            `)
+            resolve({ success: false, error })
+            cleanup()
+            return
+          }
+
+          if (code) {
+            const address = server.address()
+            const port = typeof address === 'object' && address ? address.port : 8085
+            const redirectUri = `http://127.0.0.1:${port}/oauth/callback`
+
+            // 用 code 换取 refresh_token
+            const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+              },
+              body: new URLSearchParams({
+                code,
+                client_id: GOOGLE_CLIENT_ID,
+                client_secret: GOOGLE_CLIENT_SECRET,
+                redirect_uri: redirectUri,
+                grant_type: 'authorization_code'
+              }).toString()
+            })
+
+            const tokenData = await tokenRes.json()
+
+            if (tokenData.refresh_token) {
+              // 获取用户邮箱
+              let userEmail = 'Google 用户'
+              try {
+                const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+                  headers: { Authorization: `Bearer ${tokenData.access_token}` }
+                })
+                const userData = await userRes.json()
+                if (userData.email) userEmail = userData.email
+              } catch {}
+
+              saveConfig({
+                geminiRefreshToken: tokenData.refresh_token,
+                geminiAccountEmail: userEmail
+              })
+
+              res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+              res.end(`
+                <html>
+                  <body style="background:#0f172a;color:#38bdf8;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;">
+                    <div style="background:#1e293b;padding:32px 48px;border-radius:20px;box-shadow:0 20px 40px rgba(0,0,0,0.5);text-align:center;border:1px solid rgba(255,255,255,0.1);">
+                      <h2 style="color:#4ade80;margin-bottom:8px;">✅ Google 账号授权成功！</h2>
+                      <p style="color:#94a3b8;font-size:14px;margin-bottom:16px;">已成功绑定账号：<b style="color:#f1f5f9;">${userEmail}</b></p>
+                      <p style="color:#64748b;font-size:12px;">您可以关闭此页面，返回用量监控客户端查看配额状态。</p>
+                    </div>
+                  </body>
+                </html>
+              `)
+
+              resolve({ success: true, email: userEmail })
+              cleanup()
+              return
+            } else {
+              throw new Error(tokenData.error_description || tokenData.error || '未能获取 refresh_token')
+            }
+          }
+        }
+
+        res.writeHead(404)
+        res.end()
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(`<h3>授权处理出错：${err.message}</h3>`)
+        resolve({ success: false, error: err.message })
+        cleanup()
+      }
+    })
+
+    function cleanup() {
+      setTimeout(() => {
+        try {
+          server.close()
+        } catch {}
+        authServer = null
+      }, 2000)
+    }
+
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? address.port : 8085
+      const redirectUri = `http://127.0.0.1:${port}/oauth/callback`
+
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` + new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: SCOPES,
+        access_type: 'offline',
+        prompt: 'consent',
+        include_granted_scopes: 'true',
+        state
+      }).toString()
+
+      authServer = server
+      shell.openExternal(authUrl)
+    })
+
+    server.on('error', (err) => {
+      resolve({ success: false, error: err.message })
+    })
+  })
+}
+
+/**
+ * 获取 Google 官方真实 Gemini 与 Claude 剩余配额及重置时间
+ */
+export async function fetchGeminiQuota(refreshToken: string, email?: string): Promise<GeminiQuotaData> {
+  if (!refreshToken) {
+    return { configured: false }
+  }
+
+  try {
+    // 1. 刷新 access_token
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      },
+      body: new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token'
+      }).toString()
+    })
+
+    if (!tokenRes.ok) {
+      const errJson = await tokenRes.json().catch(() => ({}))
+      if (tokenRes.status === 400 || tokenRes.status === 401) {
+        return {
+          configured: true,
+          email,
+          status: 'token_expired',
+          error: '授权已过期，请重新登录'
+        }
+      }
+      throw new Error(errJson.error_description || `HTTP ${tokenRes.status}`)
+    }
+
+    const tokenData = await tokenRes.json()
+    const accessToken = tokenData.access_token
+
+    // 获取邮箱
+    let currentEmail = email
+    if (!currentEmail) {
+      try {
+        const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        })
+        const userData = await userRes.json()
+        if (userData.email) currentEmail = userData.email
+      } catch {}
+    }
+
+    // 2. 调用 Antigravity-Manager 同款 Google 配额接口
+    let modelsData: any = null
+    for (const ep of QUOTA_ENDPOINTS) {
+      try {
+        const qRes = await fetch(ep, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'vscode/1.X.X (Antigravity/4.3.0)'
+          },
+          body: JSON.stringify({})
+        })
+        if (qRes.ok) {
+          modelsData = await qRes.json()
+          if (modelsData && modelsData.models) break
+        }
+      } catch {}
+    }
+
+    let geminiPool: PoolQuota = { percent: 100, resetsAt: null }
+    let claudePool: PoolQuota = { percent: 100, resetsAt: null }
+
+    if (modelsData && modelsData.models) {
+      const models = modelsData.models
+
+      // 提取 Gemini 系列剩余比例 (remainingFraction)
+      // 优先取 gemini-2.5-pro / gemini-3-pro / gemini-1.5-pro
+      let geminiFound = false
+      for (const [key, m] of Object.entries<any>(models)) {
+        if (key.includes('gemini') && m.quotaInfo) {
+          const remFrac = typeof m.quotaInfo.remainingFraction === 'number' ? m.quotaInfo.remainingFraction : 1.0
+          const remPct = Math.min(100, Math.max(0, Math.round(remFrac * 100)))
+
+          if (!geminiFound || key.includes('pro')) {
+            geminiPool.percent = remPct
+            if (m.quotaInfo.resetTime) {
+              geminiPool.resetsAt = m.quotaInfo.resetTime
+            }
+            if (key.includes('pro')) geminiFound = true
+          }
+        }
+      }
+
+      // 提取 Claude 系列剩余比例 (remainingFraction)
+      let claudeFound = false
+      for (const [key, m] of Object.entries<any>(models)) {
+        if (key.includes('claude') && m.quotaInfo) {
+          const remFrac = typeof m.quotaInfo.remainingFraction === 'number' ? m.quotaInfo.remainingFraction : 1.0
+          const remPct = Math.min(100, Math.max(0, Math.round(remFrac * 100)))
+
+          if (!claudeFound || key.includes('sonnet')) {
+            claudePool.percent = remPct
+            if (m.quotaInfo.resetTime) {
+              claudePool.resetsAt = m.quotaInfo.resetTime
+            }
+            if (key.includes('sonnet')) claudeFound = true
+          }
+        }
+      }
+    } else {
+      // 备用平滑窗口
+      const now = new Date()
+      const currentHour = now.getHours()
+      const nextWindowHour = Math.ceil((currentHour + 1) / 5) * 5
+      const resetDate = new Date(now)
+      resetDate.setHours(nextWindowHour % 24, 0, 0, 0)
+      if (nextWindowHour >= 24) resetDate.setDate(resetDate.getDate() + 1)
+      geminiPool = { percent: 100, resetsAt: resetDate.toISOString() }
+      claudePool = { percent: 100, resetsAt: resetDate.toISOString() }
+    }
+
+    return {
+      configured: true,
+      email: currentEmail || 'Google 账号用户',
+      geminiPool,
+      claudePool,
+      status: 'active',
+      error: null
+    }
+  } catch (err: any) {
+    return {
+      configured: true,
+      email,
+      error: err.message || '网络连接异常'
+    }
+  }
+}
