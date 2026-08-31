@@ -71,8 +71,9 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
     if (!planType) return 'ChatGPT'
     const labels: Record<string, string> = {
       plus: 'Plus',
-      pro: 'Pro',
-      prolite: 'Pro Lite',
+      // WHAM uses `prolite` for Pro 5x and `pro` for Pro 20x.
+      prolite: 'Pro 5x',
+      pro: 'Pro 20x',
       team: 'Team',
       business: 'Business',
       enterprise: 'Enterprise',

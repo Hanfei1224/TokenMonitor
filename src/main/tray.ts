@@ -35,7 +35,7 @@ function getTrayIcon(): ReturnType<typeof nativeImage.createEmpty> {
 }
 
 function showMain(win: BrowserWindow) {
-  win.setSkipTaskbar(false)
+  win.setSkipTaskbar(true)
   if (win.isMinimized()) win.restore()
   win.show()
   win.focus()

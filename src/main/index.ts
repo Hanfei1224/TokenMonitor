@@ -98,7 +98,7 @@ function stayHidden() {
 function showMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return
   keepHidden = false
-  mainWindow.setSkipTaskbar(false)
+  mainWindow.setSkipTaskbar(true)
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
   mainWindow.focus()
@@ -126,6 +126,7 @@ function openCalendarWindow() {
     resizable: false,
     center: true,
     alwaysOnTop: cfg.alwaysOnTop ?? true,
+    skipTaskbar: true,
     show: false,
     backgroundColor: '#00000000',
     icon: iconPath || icon,
@@ -194,6 +195,7 @@ function createMainWindow() {
     hasShadow: false,
     resizable: false,
     alwaysOnTop: cfg.alwaysOnTop ?? true,
+    skipTaskbar: true,
     show: false,
     backgroundColor: '#00000000',
     icon: iconPath || icon,

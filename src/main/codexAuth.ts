@@ -84,8 +84,11 @@ function readStoredAuth(): { auth: StoredCodexAuth | null; error?: string } {
   const configAuth = loadConfig().codexAuth
   if (configAuth?.encrypted) {
     const result = decryptStoredAuth(configAuth.encrypted)
-    fs.rmSync(legacyAuthFilePath(), { force: true })
-    return result
+    if (result.auth) {
+      fs.rmSync(legacyAuthFilePath(), { force: true })
+      return result
+    }
+    if (!fs.existsSync(legacyAuthFilePath())) return result
   }
 
   const filePath = legacyAuthFilePath()

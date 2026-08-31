@@ -5,14 +5,22 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.3] - 2026-09-01
+
+### Fixed
+- 修复覆盖安装后 Electron `Local State` 未保留，导致 GPT 加密授权无法解密的问题。
+- 升级时保留安装目录内的配置、统计缓存和 provider 缓存，避免更新后用量数据从空缓存开始。
+- 修复置顶磁贴被 `Win+D` 显示桌面操作最小化到后台的问题。
+- 主窗口和用量日历改为 Windows 工具窗口样式，隐藏任务栏按钮并继续通过托盘唤回。
+
 ## [1.3.1] - 2026-08-31
 
 ### Added
-- **GPT（ChatGPT Plus）额度通道**：支持应用内 ChatGPT OAuth 登录，显示账号等级和实际额度窗口，不依赖官方 Codex 客户端。
+- **GPT（ChatGPT Plus / Pro）额度通道**：支持应用内 ChatGPT OAuth 登录，按账号套餐显示 `Plus`、`Pro 5x` 或 `Pro 20x` 及实际额度窗口，不依赖官方 Codex 客户端。
 - GPT 授权使用 PKCE，本地仅通过 Electron `safeStorage` 加密保存 refresh token，access token 只在主进程内存中使用。
 
 ### Changed
-- GPT 页面默认选中，页面标题改为 `GPT`，套餐标识统一使用绿色 `Plus`。
+- GPT 页面默认选中，页面标题改为 `GPT`，套餐标识统一使用绿色，并按官方 `plan_type` 针对性显示：`plus` 为 `Plus`、`prolite` 为 `Pro 5x`、`pro` 为 `Pro 20x`。
 - 所有标准时间窗口统一为 `5H余额`、`本周余额`、`本月余额`；重置倒计时统一为 `X时X分` 或 `X天X时`。
 - 发布配置仅保留 Windows x64 NSIS 安装版，移除绿色便携版构建目标。
 - README、安装包文件名和版本号更新至 `1.3.1`。
