@@ -1,14 +1,17 @@
 import path from 'node:path'
 import { app } from 'electron'
+import { resolveStorageDir } from './storagePath.js'
 
 /**
- * 获取程序的安装根目录（绿色便携路径）
- * - 打包环境下：返回可执行文件 (.exe) 所在的完整安装目录
- * - 开发环境下：返回项目根目录
+ * 获取持久化数据目录。
+ * - 安装环境：使用可执行文件所在的安装目录
+ * - 开发环境：使用工作区固定的 .dev-data 目录
  */
 export function getStorageDir(): string {
-  if (app.isPackaged) {
-    return path.dirname(process.execPath)
-  }
+  return resolveStorageDir(app.isPackaged, process.execPath, app.getAppPath())
+}
+
+export function getLegacyDevStorageDir(): string | null {
+  if (app.isPackaged) return null
   return path.resolve(app.getAppPath(), '..')
 }

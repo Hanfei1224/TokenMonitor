@@ -39,11 +39,28 @@ export interface GeminiQuotaData {
   error?: string | null
 }
 
+export interface CodexUsageWindow {
+  id: string
+  label: string
+  percent: number
+  resetsAt: string | null
+  windowDurationMins: number | null
+}
+
+export interface CodexQuotaData {
+  configured: boolean
+  planType?: string
+  email?: string
+  windows?: CodexUsageWindow[]
+  error?: string | null
+}
+
 export interface MultiPlanUsageData {
   plan_name: string
   opencode: OpenCodeUsageData
   deepseek: DeepSeekBalanceData
   gemini: GeminiQuotaData
+  codex: CodexQuotaData
   todayStats?: any
   last_refresh?: string
   latency_ms?: number
@@ -56,6 +73,9 @@ export interface AppConfig {
   deepseekApiKey?: string
   geminiRefreshToken?: string
   geminiAccountEmail?: string
+  codexAuth?: {
+    encrypted: string
+  }
   alwaysOnTop: boolean
   clickThrough: boolean
   windowPosition?: { x: number; y: number }
@@ -78,6 +98,9 @@ declare global {
       revealOverlay: () => Promise<void>
       startGoogleOAuth: () => Promise<{ success: boolean; email?: string; error?: string }>
       logoutGoogleOAuth: () => Promise<{ success: boolean }>
+      getCodexAuthStatus: () => Promise<{ configured: boolean; email?: string; error?: string }>
+      startCodexOAuth: () => Promise<{ success: boolean; email?: string; error?: string }>
+      logoutCodexOAuth: () => Promise<{ success: boolean; error?: string }>
       openSettingsWindow: () => void
       openCalendarWindow: () => void
       closeCurrentWindow: () => void

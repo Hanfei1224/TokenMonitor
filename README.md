@@ -1,8 +1,8 @@
 # TokenMonitor
 
-> **专为 Vibe Coding 打造的开源多源 AI 用量与额度监控桌面磁贴** —— 无边框、置顶、可鼠标穿透的纯净毛玻璃悬浮小部件，支持 OpenCode Go、DeepSeek 官方、Google Gemini Pro (Claude / Gemini 双额度池) 及本地全量 Token 统计。
+> **专为 Vibe Coding 打造的开源多源 AI 用量与额度监控桌面磁贴** —— 无边框、置顶、可鼠标穿透的纯净毛玻璃悬浮小部件，支持 OpenCode Go、DeepSeek 官方、Google Gemini Pro、GPT（ChatGPT Plus）及本地全量 Token 统计。
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.1-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue)
 ![Tech](https://img.shields.io/badge/tech-Electron%20%2F%20React%2019%20%2F%20TailwindCSS%20%2F%20SQLite-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -12,9 +12,10 @@
 ## ✨ 核心特性
 
 - 🎛️ **多通道 Coding Plan 自由轮播**：
-  - **OpenCode Go**：5 小时 / 本周 / 本月三环剩余百分比 + 精准重置倒计时。
+  - **OpenCode Go**：`5H余额` / `本周余额` / `本月余额` 三环剩余百分比 + 精准重置倒计时。
   - **DeepSeek 官方**：实时账户可用余额（如 `¥ 48.65`）+ 当日动态消耗百分比环。
   - **Gemini Pro (Google)**：一键网页 OAuth 授权绑定，支持 **Gemini 模型池** 与 **Claude 模型池** 双圆环独立剩余配额与重置倒计时。
+  - **GPT（ChatGPT Plus）**：应用内 ChatGPT OAuth 登录，显示绿色 `Plus` 标识及实际 `5H余额` / `本周余额`，不依赖官方 Codex 客户端。
   - 支持左右微光箭头与指示点平滑切页，退出自动记忆停留在哪个通道。
 - 📈 **今日全量 Token 统计**：今日总消耗 / 输入 / 输出 / 缓存 / 缓存率，右侧等宽数据块，来自本机多 Agent（OpenCode、Claude Code、pi、ZCode、Codex）本地综合采集，未启动期间消耗自动补全。
 - 📊 **独立用量日历统计窗口**：居中大窗口月度贡献图，色块深浅反映当日用量，悬浮即看模型调用排行与详细指标；关闭即彻底销毁释放 Chromium 内存。
@@ -27,7 +28,7 @@
 
 ## 📸 界面预览
 
-| 主磁贴（OpenCode / DeepSeek / Gemini） | 用量日历统计窗口 |
+| 主磁贴（OpenCode / DeepSeek / Gemini / GPT） | 用量日历统计窗口 |
 | :---: | :---: |
 | ![主界面](xiaoheihe/main.png) | ![用量日历](xiaoheihe/calendar.png) |
 
@@ -37,17 +38,17 @@
 
 ### 安装
 
-前往 [GitHub Releases](https://github.com/Hanfei1224/TokenMonitor/releases) 下载最新安装包 `TokenMonitor-Setup-1.3.0.exe`，一键安装即可。
+前往 [GitHub Releases](https://github.com/Hanfei1224/TokenMonitor/releases) 下载最新安装包 `TokenMonitor Setup 1.3.1.exe`，一键安装即可。本版本只发布 Windows NSIS 安装版，不提供绿色便携版。
 
-> 安装包会自动保留配置 `config.json` 与 API 凭证。
+> 安装版及 Electron 持久化数据都位于安装目录：配置文件为 `config.json`；升级安装会自动保留其中的 API 凭证。开发版使用工作区内的 `.dev-data/config.json`，与安装版相互隔离。GPT refresh token 也保存在该文件中，但仍使用 Windows 安全存储加密。
 
 ### 快捷键与操作
 
 | 操作 / 快捷键 | 功能说明 |
 | :--- | :--- |
 | **`Ctrl + Shift + P`** | 切换鼠标穿透（点击穿透到下层窗口） |
-| **点击左/右箭头** | 切换 Coding Plan（OpenCode $\leftrightarrow$ DeepSeek $\leftrightarrow$ Gemini） |
-| **点击右上角 ⚙** | 打开多通道设置面板（支持 API Key 配置与 Google 网页一键登录） |
+| **点击左/右箭头** | 切换 Coding Plan（OpenCode $\leftrightarrow$ DeepSeek $\leftrightarrow$ Gemini $\leftrightarrow$ GPT） |
+| **点击右上角 ⚙** | 打开多通道设置面板（支持 API Key 配置、Google 登录与 ChatGPT 登录） |
 | **点击右上角 📊** | 唤起居中用量日历统计 |
 | **托盘图标右键** | 刷新数据、设置置顶/穿透、退出程序 |
 

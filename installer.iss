@@ -1,7 +1,7 @@
 ; OpencodeMonitor — Inno Setup 安装脚本
 #define MyAppName "TokenMonitor"
 #define MyAppExeName "TokenMonitor.exe"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.3.1"
 
 [Setup]
 AppId={{8E9F3B2C-5A11-4D27-9C6B-4A1E2F3C4D5E}

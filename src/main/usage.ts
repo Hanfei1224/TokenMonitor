@@ -1,5 +1,7 @@
 import { fetchDeepSeekBalance, DeepSeekBalanceData } from './deepseek.js'
 import { fetchGeminiQuota, GeminiQuotaData } from './geminiAuth.js'
+import { fetchCodexQuota } from './codexAuth.js'
+import { CodexQuotaData } from './codexUsage.js'
 import { AppConfig } from './store.js'
 
 export interface UsageWindow {
@@ -24,6 +26,7 @@ export interface MultiPlanUsageData {
   opencode: OpenCodeUsageData
   deepseek: DeepSeekBalanceData
   gemini: GeminiQuotaData
+  codex: CodexQuotaData
   todayStats?: any
   last_refresh?: string
   latency_ms?: number
@@ -72,16 +75,17 @@ export async function fetchOpenCodeUsage(apiKey?: string): Promise<OpenCodeUsage
 export async function fetchMultiPlanUsage(cfg: AppConfig, todayStats?: any): Promise<MultiPlanUsageData> {
   const t0 = Date.now()
 
-  const [opencode, deepseek, gemini] = await Promise.all([
+  const [opencode, deepseek, gemini, codex] = await Promise.all([
     fetchOpenCodeUsage(cfg.opencodeApiKey || cfg.apiKey),
     fetchDeepSeekBalance(cfg.deepseekApiKey || ''),
-    fetchGeminiQuota(cfg.geminiRefreshToken || '', cfg.geminiAccountEmail)
+    fetchGeminiQuota(cfg.geminiRefreshToken || '', cfg.geminiAccountEmail),
+    fetchCodexQuota()
   ])
 
   const latency = Date.now() - t0
 
   // 检查是否至少配置了一个通道
-  const hasAnyConfigured = opencode.configured || deepseek.configured || gemini.configured
+  const hasAnyConfigured = opencode.configured || deepseek.configured || gemini.configured || codex.configured
   let globalError: string | null = null
   if (!hasAnyConfigured) {
     globalError = 'config_missing'
@@ -92,6 +96,7 @@ export async function fetchMultiPlanUsage(cfg: AppConfig, todayStats?: any): Pro
     opencode,
     deepseek,
     gemini,
+    codex,
     todayStats,
     last_refresh: new Date().toLocaleTimeString(),
     latency_ms: latency,

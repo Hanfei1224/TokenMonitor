@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.1] - 2026-08-31
+
+### Added
+- **GPT（ChatGPT Plus）额度通道**：支持应用内 ChatGPT OAuth 登录，显示账号等级和实际额度窗口，不依赖官方 Codex 客户端。
+- GPT 授权使用 PKCE，本地仅通过 Electron `safeStorage` 加密保存 refresh token，access token 只在主进程内存中使用。
+
+### Changed
+- GPT 页面默认选中，页面标题改为 `GPT`，套餐标识统一使用绿色 `Plus`。
+- 所有标准时间窗口统一为 `5H余额`、`本周余额`、`本月余额`；重置倒计时统一为 `X时X分` 或 `X天X时`。
+- 发布配置仅保留 Windows x64 NSIS 安装版，移除绿色便携版构建目标。
+- README、安装包文件名和版本号更新至 `1.3.1`。
+
+### Fixed
+- 增加 OAuth 登录超时、重复回调保护、额度响应格式校验和过期请求结果丢弃，避免登录或轮询状态卡死。
+- 修复 NSIS 升级时清理旧安装目录导致 `config.json` 丢失的问题，并隔离开发版与安装版的配置文件。
+- GPT 授权统一写入 `config.json`，首次启动时会迁移旧的 `codex-auth.dat` 并清理旧文件。
+- 将 Electron 的 `userData` 固定到安装目录或开发版 `.dev-data`，避免程序数据散落到其他位置。
+
+---
+
 ## [1.3.0] - 2026-08-30
 
 ### Added

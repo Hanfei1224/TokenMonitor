@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { Settings, BarChart2, Pin, MousePointer, Minus, X, Activity, AlertTriangle } from 'lucide-react'
+import packageJson from '../package.json'
 import { PlanCarousel } from './components/PlanCarousel.js'
 import { TodayTokens } from './components/TodayTokens.js'
 import { SettingsWindow } from './components/SettingsWindow.js'
@@ -11,14 +12,14 @@ export default function App() {
   const initialView = (urlParams.get('view') as 'main' | 'settings' | 'calendar') || 'main'
 
   const [view, setView] = useState<'main' | 'settings' | 'calendar'>(initialView)
-  const [settingsTab, setSettingsTab] = useState<'opencode' | 'deepseek' | 'gemini'>('opencode')
+  const [settingsTab, setSettingsTab] = useState<'opencode' | 'deepseek' | 'gemini' | 'codex'>('opencode')
   const [usageData, setUsageData] = useState<any>(null)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [isAlwaysOnTop, setIsAlwaysOnTop] = useState(true)
   const [isClickThrough, setIsClickThrough] = useState(false)
   const [mainReady, setMainReady] = useState(true)
 
-  const showOverlay = (mode: 'settings' | 'calendar', tab?: 'opencode' | 'deepseek' | 'gemini') => {
+  const showOverlay = (mode: 'settings' | 'calendar', tab?: 'opencode' | 'deepseek' | 'gemini' | 'codex') => {
     if (mode === 'calendar') {
       window.electronAPI?.openCalendarWindow?.()
       return
@@ -159,6 +160,9 @@ export default function App() {
             <div className="w-2.5 h-2.5 rounded-full bg-blue-500" />
             <span className="text-xs font-semibold tracking-wider text-white/90">
               TokenMonitor
+            </span>
+            <span className="text-[10px] text-white/40 tabular-nums whitespace-nowrap">
+              v{packageJson.version}
             </span>
             {getLatencyBadge(usageData?.latency_ms)}
           </div>

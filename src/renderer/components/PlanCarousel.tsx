@@ -1,16 +1,16 @@
 import React, { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { ChevronLeft, ChevronRight, Key, ShieldCheck } from 'lucide-react'
+import { Bot, ChevronLeft, ChevronRight, Key, ShieldCheck } from 'lucide-react'
 import { RingProgress } from './RingProgress.js'
 import { MultiPlanUsageData } from '../types.js'
 
 interface PlanCarouselProps {
   data: MultiPlanUsageData | null
-  onOpenSettings: (tab?: 'opencode' | 'deepseek' | 'gemini') => void
+  onOpenSettings: (tab?: 'opencode' | 'deepseek' | 'gemini' | 'codex') => void
 }
 
 export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings }) => {
-  const [currentIndex, setCurrentIndex] = useState(0)
+  const [currentIndex, setCurrentIndex] = useState(3)
 
   const plans = [
     {
@@ -26,6 +26,11 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
     {
       id: 'gemini',
       name: 'Gemini Pro (Google)',
+      type: 'oauth'
+    },
+    {
+      id: 'codex',
+      name: 'GPT',
       type: 'oauth'
     }
   ]
@@ -62,6 +67,22 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
 
   const currentPlan = plans[currentIndex]
 
+  const formatPlanType = (planType?: string) => {
+    if (!planType) return 'ChatGPT'
+    const labels: Record<string, string> = {
+      plus: 'Plus',
+      pro: 'Pro',
+      prolite: 'Pro Lite',
+      team: 'Team',
+      business: 'Business',
+      enterprise: 'Enterprise',
+      free: 'Free'
+    }
+    return labels[planType.toLowerCase()] || planType
+  }
+
+  const currentPlanName = currentPlan.name
+
   // 1. 渲染 OpenCode Go（统一为剩余百分比：100 - usedPercent）
   const renderOpenCode = () => {
     const opencode = data?.opencode
@@ -97,17 +118,17 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
     return (
       <div className="flex items-center justify-between w-full h-full px-0.5">
         <RingProgress
-          label="5小时剩余"
+          label="5H余额"
           percent={rollingRemain}
           resetsAt={opencode.usage?.rolling?.resetsAt}
         />
         <RingProgress
-          label="本周剩余"
+          label="本周余额"
           percent={weeklyRemain}
           resetsAt={opencode.usage?.weekly?.resetsAt}
         />
         <RingProgress
-          label="本月剩余"
+          label="本月余额"
           percent={monthlyRemain}
           resetsAt={opencode.usage?.monthly?.resetsAt}
         />
@@ -221,12 +242,70 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
     )
   }
 
+  // 4. 渲染 Codex（只展示接口实际返回的窗口）
+  const renderCodex = () => {
+    const codex = data?.codex
+    if (!codex?.configured) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full gap-2 text-white/50">
+          <Bot className="w-6 h-6 text-emerald-400/60" />
+          <span className="text-[11px]">未登录 ChatGPT 账号</span>
+          <button
+            onClick={() => onOpenSettings('codex')}
+            className="px-2.5 py-0.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-[10px] border border-emerald-500/30 transition-all"
+          >
+            去登录
+          </button>
+        </div>
+      )
+    }
+
+    if (codex.error) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full gap-1 text-rose-300/80 text-center px-2">
+          <span className="text-xs font-semibold">GPT 状态异常</span>
+          <span className="text-[10px] text-rose-400/60">{codex.error}</span>
+          <button
+            onClick={() => onOpenSettings('codex')}
+            className="mt-1 px-2.5 py-0.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-[10px] border border-emerald-500/30 transition-all"
+          >
+            重新登录
+          </button>
+        </div>
+      )
+    }
+
+    const windows = codex.windows || []
+    return (
+      <div className="flex flex-col w-full h-full justify-between py-0.5">
+        <div className="flex items-center justify-between px-1 text-[10px]">
+          <span className="text-emerald-400 font-semibold">{formatPlanType(codex.planType)}</span>
+          <span className="text-white/40 truncate max-w-[150px]">{codex.email || 'ChatGPT 账号'}</span>
+        </div>
+        {windows.length > 0 ? (
+          <div className="flex items-center justify-around w-full">
+            {windows.map((window) => (
+              <RingProgress
+                key={window.id}
+                label={window.label}
+                percent={window.percent}
+                resetsAt={window.resetsAt}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="text-center text-[11px] text-white/50">当前账号暂无额度窗口</div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="relative flex flex-col flex-1 h-[142px] overflow-hidden group px-1">
       {/* 顶部指示标头：左侧名称 + 右上角滚动指示小点 */}
       <div className="flex items-center justify-between pb-1 px-0.5 shrink-0">
         <span className="text-[11px] font-medium text-white/70 tracking-wide">
-          {currentPlan.name}
+          {currentPlanName}
         </span>
         {/* 右上角指示小点 */}
         <div className="flex items-center gap-1.5">
@@ -256,6 +335,7 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
             {currentIndex === 0 && renderOpenCode()}
             {currentIndex === 1 && renderDeepSeek()}
             {currentIndex === 2 && renderGemini()}
+            {currentIndex === 3 && renderCodex()}
           </motion.div>
         </AnimatePresence>
 

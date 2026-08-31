@@ -36,11 +36,15 @@ export const UsageCard: React.FC<UsageCardProps> = ({ title, windowType, data })
     try {
       const d = new Date(isoString)
       const now = new Date()
-      const diffMinutes = Math.max(0, Math.round((d.getTime() - now.getTime()) / 60000))
-      if (diffMinutes < 60) return `${diffMinutes} 分钟后重置`
-      const hours = Math.floor(diffMinutes / 60)
-      const mins = diffMinutes % 60
-      return `${hours}小时${mins > 0 ? `${mins}分` : ''}后重置`
+      const diffMinutes = Math.max(1, Math.ceil((d.getTime() - now.getTime()) / 60000))
+      if (windowType === 'rolling') {
+        const hours = Math.floor(diffMinutes / 60)
+        const mins = diffMinutes % 60
+        return `${hours}时${mins}分`
+      }
+      const days = Math.floor(diffMinutes / (24 * 60))
+      const hours = Math.floor((diffMinutes % (24 * 60)) / 60)
+      return `${days}天${hours}时`
     } catch {
       return null
     }

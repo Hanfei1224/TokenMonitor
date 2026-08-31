@@ -1,19 +1,23 @@
 import React, { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { X, Key, Check, Settings, ShieldCheck, LogOut, ExternalLink, Loader2 } from 'lucide-react'
+import { Bot, X, Key, Check, Settings, ShieldCheck, LogOut, ExternalLink, Loader2 } from 'lucide-react'
 import { popupAnimate, popupInitial, popupSpring, usePopupEnter } from '../popupMotion.js'
 
 interface SettingsWindowProps {
   onClose: () => void
-  initialTab?: 'opencode' | 'deepseek' | 'gemini'
+  initialTab?: 'opencode' | 'deepseek' | 'gemini' | 'codex'
 }
 
 export const SettingsWindow: React.FC<SettingsWindowProps> = ({ onClose, initialTab = 'opencode' }) => {
-  const [activeTab, setActiveTab] = useState<'opencode' | 'deepseek' | 'gemini'>(initialTab)
+  const [activeTab, setActiveTab] = useState<'opencode' | 'deepseek' | 'gemini' | 'codex'>(initialTab)
   const [opencodeKey, setOpencodeKey] = useState('')
   const [deepseekKey, setDeepseekKey] = useState('')
   const [geminiEmail, setGeminiEmail] = useState<string | null>(null)
+  const [codexConfigured, setCodexConfigured] = useState(false)
+  const [codexEmail, setCodexEmail] = useState<string | null>(null)
+  const [codexAuthError, setCodexAuthError] = useState<string | null>(null)
   const [isLoggingInGoogle, setIsLoggingInGoogle] = useState(false)
+  const [isLoggingInCodex, setIsLoggingInCodex] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [savedSuccess, setSavedSuccess] = useState(false)
   const enter = usePopupEnter()
@@ -26,6 +30,11 @@ export const SettingsWindow: React.FC<SettingsWindowProps> = ({ onClose, initial
         setOpencodeKey(cfg.opencodeApiKey || cfg.apiKey || '')
         setDeepseekKey(cfg.deepseekApiKey || '')
         setGeminiEmail(cfg.geminiAccountEmail || null)
+      })
+      window.electronAPI.getCodexAuthStatus().then((status) => {
+        setCodexConfigured(status.configured)
+        setCodexEmail(status.email || null)
+        setCodexAuthError(status.error || null)
       })
     }
   }
@@ -72,6 +81,35 @@ export const SettingsWindow: React.FC<SettingsWindowProps> = ({ onClose, initial
     if (!window.electronAPI) return
     await window.electronAPI.logoutGoogleOAuth()
     setGeminiEmail(null)
+  }
+
+  const handleCodexLogin = async () => {
+    if (!window.electronAPI || isLoggingInCodex) return
+    setIsLoggingInCodex(true)
+    setCodexAuthError(null)
+    try {
+      const res = await window.electronAPI.startCodexOAuth()
+      if (res.success) {
+        setCodexConfigured(true)
+        setCodexEmail(res.email || null)
+      } else {
+        setCodexAuthError(res.error || 'ChatGPT 登录失败')
+      }
+    } finally {
+      setIsLoggingInCodex(false)
+    }
+  }
+
+  const handleCodexLogout = async () => {
+    if (!window.electronAPI) return
+    const res = await window.electronAPI.logoutCodexOAuth()
+    if (res.success) {
+      setCodexConfigured(false)
+      setCodexEmail(null)
+      setCodexAuthError(null)
+    } else {
+      setCodexAuthError(res.error || '退出 ChatGPT 授权失败')
+    }
   }
 
   return (
@@ -121,6 +159,16 @@ export const SettingsWindow: React.FC<SettingsWindowProps> = ({ onClose, initial
               }`}
             >
               Gemini
+            </button>
+            <button
+              onClick={() => setActiveTab('codex')}
+              className={`px-2.5 py-0.5 rounded-lg text-[11px] font-medium transition-all ${
+                activeTab === 'codex'
+                  ? 'bg-emerald-500 text-white shadow-sm'
+                  : 'text-white/60 hover:text-white'
+              }`}
+            >
+              GPT
             </button>
           </div>
 
@@ -215,6 +263,57 @@ export const SettingsWindow: React.FC<SettingsWindowProps> = ({ onClose, initial
                   )}
                 </button>
               )}
+            </div>
+          )}
+
+          {activeTab === 'codex' && (
+            <div className="flex flex-col gap-2">
+              <label className="text-white/80 font-medium flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <Bot className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>ChatGPT OAuth 网页登录</span>
+                </span>
+                <span className="text-[10px] text-white/40">用于读取 Codex 套餐额度</span>
+              </label>
+
+              {codexConfigured ? (
+                <div className="flex items-center justify-between p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+                  <div className="flex flex-col">
+                    <span className="text-[10px] text-emerald-300/70">当前授权账号</span>
+                    <span className="text-xs font-semibold text-emerald-200">{codexEmail || 'ChatGPT 账号'}</span>
+                  </div>
+                  <button
+                    onClick={handleCodexLogout}
+                    className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-[11px] flex items-center gap-1 border border-rose-500/30 transition-all"
+                  >
+                    <LogOut className="w-3 h-3" />
+                    退出授权
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={handleCodexLogin}
+                  disabled={isLoggingInCodex}
+                  className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-98 text-white font-medium text-xs flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition-all"
+                >
+                  {isLoggingInCodex ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>正在打开浏览器等待登录...</span>
+                    </>
+                  ) : (
+                    <>
+                      <ExternalLink className="w-4 h-4" />
+                      <span>在浏览器中登录 ChatGPT</span>
+                    </>
+                  )}
+                </button>
+              )}
+
+              {codexAuthError && (
+                <span className="text-[10px] text-rose-400/80">{codexAuthError}</span>
+              )}
+              <span className="text-[10px] text-white/35">refresh token 使用系统安全存储加密保存，不使用官方 Codex 客户端。</span>
             </div>
           )}
         </div>

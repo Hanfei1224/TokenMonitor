@@ -3,8 +3,10 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { app, BrowserWindow, ipcMain, screen, nativeImage, globalShortcut } from 'electron'
 import { loadConfig, saveConfig } from './store.js'
+import { getStorageDir } from './paths.js'
 import { fetchMultiPlanUsage, MultiPlanUsageData } from './usage.js'
 import { startGoogleOAuth } from './geminiAuth.js'
+import { getCodexAuthStatus, logoutCodexOAuth, startCodexOAuth } from './codexAuth.js'
 import { createTray } from './tray.js'
 import { startStatsBackgroundScanner, getCachedTodayStats, getCachedMonthStats } from './stats.js'
 
@@ -27,13 +29,25 @@ const CAL_H = 620
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,TranslateUI,MediaRouter')
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=128')
 app.setName(APP_DISPLAY_NAME)
+const storageDir = getStorageDir()
+const sessionDir = path.join(storageDir, 'session')
+fs.mkdirSync(storageDir, { recursive: true })
+fs.mkdirSync(sessionDir, { recursive: true })
+app.setPath('userData', storageDir)
+app.setPath('sessionData', sessionDir)
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.token.monitor')
+}
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
 }
 
 let mainWindow: BrowserWindow | null = null
 let calendarWindow: BrowserWindow | null = null
 let pollTimer: NodeJS.Timeout | null = null
+let pollGeneration = 0
 let statsScannerStarted = false
 let keepHidden = false
 let isQuitting = false
@@ -43,6 +57,7 @@ let currentUsageData: MultiPlanUsageData = {
   opencode: { configured: false },
   deepseek: { configured: false },
   gemini: { configured: false },
+  codex: { configured: false },
   error: 'initializing'
 }
 
@@ -268,6 +283,23 @@ function createMainWindow() {
 }
 
 const POLL_INTERVAL_MS = 60 * 1000
+const POLL_TIMEOUT_MS = 30 * 1000
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('用量请求超时')), timeoutMs)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      }
+    )
+  })
+}
 
 async function scheduleNextPoll() {
   if (pollTimer) {
@@ -275,15 +307,20 @@ async function scheduleNextPoll() {
     pollTimer = null
   }
 
+  const generation = ++pollGeneration
   const startTime = Date.now()
   try {
     const cfg = loadConfig()
     const todayStats = getCachedTodayStats()
-    currentUsageData = await fetchMultiPlanUsage(cfg, todayStats)
-    mainWindow?.webContents.send('usage-update', currentUsageData)
+    const nextUsageData = await withTimeout(fetchMultiPlanUsage(cfg, todayStats), POLL_TIMEOUT_MS)
+    if (generation === pollGeneration) {
+      currentUsageData = nextUsageData
+      mainWindow?.webContents.send('usage-update', currentUsageData)
+    }
   } catch (err) {
     console.error('Fetch multi plan usage error:', err)
   } finally {
+    if (generation !== pollGeneration) return
     // 以发出请求的时间为起点，计算等待 60 秒后的下一次时间点
     const elapsed = Date.now() - startTime
     const delay = Math.max(0, POLL_INTERVAL_MS - elapsed)
@@ -338,6 +375,24 @@ ipcMain.handle('logout-google-oauth', async () => {
   return { success: true }
 })
 
+ipcMain.handle('get-codex-auth-status', () => getCodexAuthStatus())
+
+ipcMain.handle('start-codex-oauth', async () => {
+  const res = await startCodexOAuth()
+  if (res.success) {
+    void scheduleNextPoll()
+  }
+  return res
+})
+
+ipcMain.handle('logout-codex-oauth', async () => {
+  const res = logoutCodexOAuth()
+  if (res.success) {
+    void scheduleNextPoll()
+  }
+  return res
+})
+
 ipcMain.on('open-settings-window', () => {
   requestOverlay('settings')
 })
@@ -374,6 +429,7 @@ ipcMain.on('window-close', () => {
 })
 
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return
   process.title = appTitle()
   createMainWindow()
 

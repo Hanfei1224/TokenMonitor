@@ -3,6 +3,7 @@
 config.json
 stats_cache.json
 deepseek_daily.json
+.dev-data/
 
 # ===== 构建产物 =====
 dist/

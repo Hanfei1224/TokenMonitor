@@ -14,14 +14,12 @@ asarUnpack:
 win:
   executableName: TokenMonitor
   target:
-    - target: dir
-      arch:
-        - x64
     - target: nsis
       arch:
         - x64
   icon: icon.ico
 nsis:
+  include: installer.nsh
   shortcutName: TokenMonitor
   oneClick: false
   allowToChangeInstallationDirectory: true
