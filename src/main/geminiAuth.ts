@@ -1,7 +1,6 @@
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { shell } from 'electron'
-import { loadConfig, saveConfig } from './store.js'
 
 // Antigravity 官方维护的 Google OAuth 生产凭据
 const GOOGLE_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com'
@@ -19,6 +18,12 @@ const QUOTA_ENDPOINTS = [
   'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
   'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
   'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels'
+]
+
+const PLAN_ENDPOINTS = [
+  'https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+  'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+  'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist'
 ]
 
 let authServer: http.Server | null = null
@@ -43,17 +48,93 @@ export interface PoolQuota {
 
 export interface GeminiQuotaData {
   configured: boolean
+  accountId?: string
+  accountName?: string
   email?: string
+  planType?: string
   geminiPool?: PoolQuota
   claudePool?: PoolQuota
   status?: string
   error?: string | null
 }
 
+function normalizeGeminiPlanType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  if (!normalized) return undefined
+  if (normalized.includes('ultra')) return 'Ultra'
+  if (normalized.includes('pro')) return 'Pro'
+  if (normalized.includes('premium')) return 'Pro'
+  if (normalized.includes('plus')) return 'Plus'
+  if (normalized.includes('free')) return 'Free'
+  if (normalized.includes('standard')) return 'Standard'
+  // Antigravity-Manager treats any returned but unrecognized tier as Free.
+  return 'Free'
+}
+
+interface GeminiTier {
+  id?: string
+  name?: string
+  isDefault?: boolean
+  is_default?: boolean
+}
+
+interface GeminiPlanResponse {
+  planType?: string
+  paidTier?: GeminiTier
+  currentTier?: GeminiTier
+  allowedTiers?: GeminiTier[]
+  ineligibleTiers?: unknown[]
+}
+
+function tierValue(tier?: GeminiTier): string | undefined {
+  return tier?.name || tier?.id
+}
+
+function extractGeminiPlanType(data: GeminiPlanResponse): string | undefined {
+  const paidTier = tierValue(data.paidTier)
+  const ineligible = Array.isArray(data.ineligibleTiers) && data.ineligibleTiers.length > 0
+  const fallbackTier = ineligible
+    ? data.allowedTiers?.find((tier) => tier.isDefault === true || tier.is_default === true)
+    : data.currentTier
+
+  return normalizeGeminiPlanType(data.planType || paidTier || tierValue(fallbackTier))
+}
+
+async function fetchGeminiPlanType(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
+  for (const endpoint of PLAN_ENDPOINTS) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'vscode/1.X.X (Antigravity/4.3.0)'
+        },
+        body: JSON.stringify({
+          metadata: {
+            ideType: 'ANTIGRAVITY'
+          }
+        }),
+        signal
+      })
+      throwIfAborted(signal)
+      if (!response.ok) continue
+
+      const data = await readJson<GeminiPlanResponse>(response, signal)
+      const planType = extractGeminiPlanType(data)
+      if (planType) return planType
+    } catch {
+      throwIfAborted(signal)
+    }
+  }
+  return undefined
+}
+
 /**
  * 启动本地临时 OAuth HTTP 服务器并打开浏览器
  */
-export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; error?: string }> {
+export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; refreshToken?: string; error?: string }> {
   cancelActiveGoogleLogin?.()
 
   return new Promise((resolve) => {
@@ -69,7 +150,7 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
       authServer = null
     }
 
-    const finish = (result: { success: boolean; email?: string; error?: string }) => {
+    const finish = (result: { success: boolean; email?: string; refreshToken?: string; error?: string }) => {
       if (settled) return
       settled = true
       if (loginTimer) clearTimeout(loginTimer)
@@ -152,11 +233,6 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
                 throwIfAborted(requestController.signal)
               }
 
-              saveConfig({
-                geminiRefreshToken: tokenData.refresh_token,
-                geminiAccountEmail: userEmail
-              })
-
               res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
               res.end(`
                 <html>
@@ -170,7 +246,7 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
                 </html>
               `)
 
-              finish({ success: true, email: userEmail })
+              finish({ success: true, email: userEmail, refreshToken: tokenData.refresh_token })
               return
             } else {
               throw new Error(tokenData.error_description || tokenData.error || '未能获取 refresh_token')
@@ -286,6 +362,8 @@ export async function fetchGeminiQuota(
     const tokenData = await readJson<any>(tokenRes, signal)
     const accessToken = tokenData.access_token
 
+    const planType = await fetchGeminiPlanType(accessToken, signal)
+
     // 获取邮箱
     let currentEmail = email
     if (!currentEmail) {
@@ -380,6 +458,7 @@ export async function fetchGeminiQuota(
     return {
       configured: true,
       email: currentEmail || 'Google 账号用户',
+      planType,
       geminiPool,
       claudePool,
       status: 'active',

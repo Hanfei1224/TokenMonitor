@@ -75,7 +75,7 @@ test('aggregates OpenCode messages in the worker', async () => {
       db.close()
     }
 
-    const result = await runWorker({ kind: 'opencode', dbPaths: [fixture.path], startMs: firstTs - 1 })
+    const result = await runWorker({ kind: 'opencode', dbPaths: [fixture.path], startMs: firstTs - 1, reconcileStartMs: secondTs - 1 })
     assert.equal(result.maxTs, nextDayTs)
     assert.equal('rows' in result, false)
     assert.equal(result.aggregates.length, 2)
@@ -88,6 +88,17 @@ test('aggregates OpenCode messages in the worker', async () => {
       cache_read: 3,
       cache_write: 2,
       requests: 2,
+      max_ts: secondTs
+    })
+    assert.deepEqual(result.recent.aggregates.find((row) => row.model === 'model-a'), {
+      date: localDate(firstTs),
+      model: 'model-a',
+      total: 5,
+      input: 1,
+      output: 2,
+      cache_read: 1,
+      cache_write: 1,
+      requests: 1,
       max_ts: secondTs
     })
   } finally {

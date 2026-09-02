@@ -1,37 +1,21 @@
 import fs from 'node:fs'
 import os from 'node:os'
-import readline from 'node:readline'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { app } from 'electron'
 import { getStorageDir } from './paths.js'
+import {
+  cloneAggregateDays,
+  createDayStats,
+  mergeAggregateDays,
+  scanJsonlRoot,
+  type AggregateDays,
+  type DayStats,
+  type JsonlFileState,
+  type JsonlSource
+} from './statsScanner.js'
 
-export interface TokenStatsRow {
-  ts: number
-  total: number
-  input: number
-  output: number
-  cache_read: number
-  cache_write: number
-  source?: string
-  provider?: string
-  agent?: string
-  model?: string
-  estimated?: boolean
-}
-
-export interface DayStats {
-  date: string
-  total: number
-  input: number
-  output: number
-  cache_read: number
-  cache_write: number
-  hit_rate: number
-  requests: number
-  byModel: Record<string, number>
-  byModelCalls: Record<string, number>
-}
+export type { DayStats, TokenStatsRow } from './statsScanner.js'
 
 export interface UsageBreakdown {
   bySource: Record<string, number>
@@ -59,6 +43,7 @@ export interface MonthStatsData {
 
 interface PersistentStatsCache {
   version: number
+  initialized: boolean
   watermarks: {
     opencode_max_ts: number
     zcode_max_ts: number
@@ -66,6 +51,11 @@ interface PersistentStatsCache {
     pi_scan_time: number
     codex_scan_time: number
   }
+  sqliteDays: {
+    opencode: AggregateDays
+    zcode: AggregateDays
+  }
+  jsonlFiles: Record<string, JsonlFileState>
   days: Record<string, DayStats>
 }
 
@@ -76,7 +66,7 @@ interface StatsCache {
   isScanning: boolean
 }
 
-const STATS_CACHE_VERSION = 2
+const STATS_CACHE_VERSION = 3
 
 const emptyBreakdown = (): UsageBreakdown => ({
   bySource: {},
@@ -95,25 +85,12 @@ const statsCache: StatsCache = {
 
 let statsBackgroundScannerStarted = false
 let statsInterval: ReturnType<typeof setInterval> | null = null
-
-interface JsonlFileState {
-  size: number
-  mtimeMs: number
-}
-
-const jsonlFileStates = new Map<string, JsonlFileState>()
 const activeSqliteWorkers = new Set<ReturnType<typeof spawn>>()
 
 function bump(map: Record<string, number>, key: string | undefined, n: number) {
   if (!key || !n) return
   map[key] = (map[key] || 0) + n
 }
-
-function rowModel(r: TokenStatsRow): string {
-  return r.model || r.provider || r.source || 'unknown'
-}
-
-type AggregateDays = Record<string, DayStats>
 
 interface AggregateScan {
   days: AggregateDays
@@ -126,71 +103,15 @@ interface SqliteWorkerRequest {
   dbPath?: string
   dbPaths?: string[]
   startMs: number
+  reconcileStartMs?: number
 }
 
 const SQLITE_WORKER_TIMEOUT_MS = 60 * 1000
-
-function createDayStats(date: string): DayStats {
-  return {
-    date,
-    total: 0,
-    input: 0,
-    output: 0,
-    cache_read: 0,
-    cache_write: 0,
-    hit_rate: 0,
-    requests: 0,
-    byModel: {},
-    byModelCalls: {}
-  }
-}
-
-function dayKeyForTimestamp(ts: number): string {
-  const d = new Date(ts)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
 
 function updateHitRate(day: DayStats): void {
   const cacheTotal = day.cache_read + day.cache_write
   if (day.input + cacheTotal > 0) {
     day.hit_rate = Math.round((cacheTotal / (day.input + cacheTotal)) * 100)
-  }
-}
-
-function addTokenRow(days: AggregateDays, row: TokenStatsRow): void {
-  const date = dayKeyForTimestamp(row.ts)
-  const day = days[date] || (days[date] = createDayStats(date))
-
-  day.total += row.total
-  day.input += row.input
-  day.output += row.output
-  day.cache_read += row.cache_read
-  day.cache_write += row.cache_write
-  day.requests += 1
-
-  const model = rowModel(row)
-  bump(day.byModel, model, row.total)
-  bump(day.byModelCalls, model, 1)
-  updateHitRate(day)
-}
-
-function mergeAggregateDays(target: AggregateDays, source: AggregateDays): void {
-  for (const [date, sourceDay] of Object.entries(source)) {
-    const targetDay = target[date] || (target[date] = createDayStats(date))
-    targetDay.total += sourceDay.total
-    targetDay.input += sourceDay.input
-    targetDay.output += sourceDay.output
-    targetDay.cache_read += sourceDay.cache_read
-    targetDay.cache_write += sourceDay.cache_write
-    targetDay.requests += sourceDay.requests
-
-    for (const [model, total] of Object.entries(sourceDay.byModel || {})) {
-      bump(targetDay.byModel, model, total)
-    }
-    for (const [model, calls] of Object.entries(sourceDay.byModelCalls || {})) {
-      bump(targetDay.byModelCalls, model, calls)
-    }
-    updateHitRate(targetDay)
   }
 }
 
@@ -348,13 +269,33 @@ function parseSqliteAggregate(value: unknown, startMs: number): AggregateScan {
   return { days, maxTs, successful: true }
 }
 
+interface SqliteScan {
+  incremental: AggregateScan
+  recent: AggregateScan | null
+}
+
+function parseSqliteScan(value: unknown, startMs: number, reconcileStartMs: number | undefined): SqliteScan {
+  const result = parseSqliteAggregate(value, startMs)
+  if (!reconcileStartMs || !value || typeof value !== 'object') {
+    return { incremental: result, recent: null }
+  }
+
+  const recentValue = (value as { recent?: unknown }).recent
+  if (!recentValue) return { incremental: result, recent: null }
+  return {
+    incremental: result,
+    recent: parseSqliteAggregate(recentValue, reconcileStartMs)
+  }
+}
+
 function getCacheFilePath(): string {
   return path.join(getStorageDir(), 'stats_cache.json')
 }
 
-function loadPersistentCache(): PersistentStatsCache {
-  const defaultCache: PersistentStatsCache = {
+function defaultPersistentCache(): PersistentStatsCache {
+  return {
     version: STATS_CACHE_VERSION,
+    initialized: false,
     watermarks: {
       opencode_max_ts: 0,
       zcode_max_ts: 0,
@@ -362,33 +303,74 @@ function loadPersistentCache(): PersistentStatsCache {
       pi_scan_time: 0,
       codex_scan_time: 0
     },
+    sqliteDays: {
+      opencode: {},
+      zcode: {}
+    },
+    jsonlFiles: {},
     days: {}
   }
+}
+
+function backupLegacyCache(cachePath: string): void {
+  const backupPath = `${cachePath}.legacy-backup.json`
+  try {
+    if (!fs.existsSync(backupPath)) fs.copyFileSync(cachePath, backupPath)
+  } catch (e) {
+    console.error('Failed to back up legacy stats cache:', e)
+  }
+}
+
+function loadPersistentCache(): PersistentStatsCache {
+  const defaultCache = defaultPersistentCache()
 
   const p = getCacheFilePath()
   if (fs.existsSync(p)) {
+    let parsed: any
     try {
-      const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'))
-      if (parsed?.version === STATS_CACHE_VERSION && parsed.days) {
+      parsed = JSON.parse(fs.readFileSync(p, 'utf-8'))
+      if (
+        parsed?.version === STATS_CACHE_VERSION &&
+        typeof parsed.initialized === 'boolean' &&
+        parsed.days &&
+        parsed.sqliteDays?.opencode &&
+        parsed.sqliteDays?.zcode &&
+        parsed.jsonlFiles
+      ) {
         return {
           version: STATS_CACHE_VERSION,
+          initialized: parsed.initialized,
           watermarks: { ...defaultCache.watermarks, ...(parsed.watermarks || {}) },
+          sqliteDays: {
+            opencode: parsed.sqliteDays.opencode,
+            zcode: parsed.sqliteDays.zcode
+          },
+          jsonlFiles: parsed.jsonlFiles,
           days: parsed.days || {}
         }
       }
     } catch (e) {
       console.error('Failed to parse stats_cache.json:', e)
     }
+    backupLegacyCache(p)
   }
   return defaultCache
 }
 
 function savePersistentCache(data: PersistentStatsCache): void {
+  const p = getCacheFilePath()
+  const tempPath = `${p}.${process.pid}.tmp`
   try {
-    const p = getCacheFilePath()
-    fs.writeFileSync(p, JSON.stringify(data), 'utf-8')
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(tempPath, JSON.stringify(data), 'utf-8')
+    fs.renameSync(tempPath, p)
   } catch (e) {
     console.error('Failed to save stats_cache.json:', e)
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath)
+    } catch {
+      // Keep the last valid cache when cleanup is not possible.
+    }
   }
 }
 
@@ -481,60 +463,6 @@ function isoToMs(ts: string): number {
   return Number.isNaN(n) ? 0 : n
 }
 
-async function walkJsonl(
-  root: string,
-  filterMtimeMs: number,
-  parseLine: (line: string) => TokenStatsRow | null
-): Promise<AggregateDays> {
-  const days: AggregateDays = {}
-  if (!fs.existsSync(root)) return days
-
-  async function walkDir(dir: string) {
-    let entries: fs.Dirent[]
-    try {
-      entries = await fs.promises.readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name)
-      if (entry.isDirectory()) {
-        await walkDir(fullPath)
-        continue
-      }
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
-      let stream: fs.ReadStream | null = null
-      let rl: readline.Interface | null = null
-      try {
-        const stat = await fs.promises.stat(fullPath)
-        const previous = jsonlFileStates.get(fullPath)
-        const currentState = { size: stat.size, mtimeMs: stat.mtimeMs }
-        if (filterMtimeMs > 0 && stat.mtimeMs < filterMtimeMs) {
-          jsonlFileStates.set(fullPath, currentState)
-          continue
-        }
-        if (filterMtimeMs > 0 && previous?.size === stat.size && previous.mtimeMs === stat.mtimeMs) continue
-        stream = fs.createReadStream(fullPath, { encoding: 'utf-8' })
-        rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
-        for await (const line of rl) {
-          const row = parseLine(line)
-          if (row && (filterMtimeMs === 0 || row.ts > filterMtimeMs)) addTokenRow(days, row)
-        }
-        const finalStat = await fs.promises.stat(fullPath)
-        jsonlFileStates.set(fullPath, { size: finalStat.size, mtimeMs: finalStat.mtimeMs })
-      } catch {
-        // skip unreadable file
-      } finally {
-        rl?.close()
-        stream?.destroy()
-      }
-    }
-  }
-
-  await walkDir(root)
-  return days
-}
-
 function opencodeDbPaths(): string[] {
   return [
     path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db'),
@@ -543,40 +471,52 @@ function opencodeDbPaths(): string[] {
   ]
 }
 
-async function scanOpencodeAggregate(startMs: number): Promise<AggregateScan> {
+async function scanOpencodeAggregate(startMs: number, reconcileStartMs?: number): Promise<SqliteScan> {
   const dbPaths = opencodeDbPaths()
   if (!dbPaths.some((dbPath) => fs.existsSync(dbPath))) {
-    return { days: {}, maxTs: startMs, successful: true }
+    return {
+      incremental: { days: {}, maxTs: startMs, successful: true },
+      recent: reconcileStartMs ? { days: {}, maxTs: reconcileStartMs, successful: true } : null
+    }
   }
 
   try {
-    const result = await runSqliteWorker({ kind: 'opencode', dbPaths, startMs })
-    return parseSqliteAggregate(result, startMs)
+    const result = await runSqliteWorker({ kind: 'opencode', dbPaths, startMs, reconcileStartMs })
+    return parseSqliteScan(result, startMs, reconcileStartMs)
   } catch (err) {
     console.error('OpenCode SQLite worker scan skipped:', err)
     // Keep the watermark unchanged so a later scan retries the missing data.
-    return { days: {}, maxTs: startMs, successful: false }
+    return {
+      incremental: { days: {}, maxTs: startMs, successful: false },
+      recent: reconcileStartMs ? { days: {}, maxTs: reconcileStartMs, successful: false } : null
+    }
   }
 }
 
-async function scanZcodeAggregate(startMs: number): Promise<AggregateScan> {
+async function scanZcodeAggregate(startMs: number, reconcileStartMs?: number): Promise<SqliteScan> {
   const dbPath = path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite')
   if (!fs.existsSync(dbPath)) {
-    return { days: {}, maxTs: startMs, successful: true }
+    return {
+      incremental: { days: {}, maxTs: startMs, successful: true },
+      recent: reconcileStartMs ? { days: {}, maxTs: reconcileStartMs, successful: true } : null
+    }
   }
 
   try {
-    const result = await runSqliteWorker({ kind: 'zcode', dbPath, startMs })
-    return parseSqliteAggregate(result, startMs)
+    const result = await runSqliteWorker({ kind: 'zcode', dbPath, startMs, reconcileStartMs })
+    return parseSqliteScan(result, startMs, reconcileStartMs)
   } catch (err) {
     console.error('ZCode SQLite worker scan skipped:', err)
     // Keep the watermark unchanged so a later scan retries the missing data.
-    return { days: {}, maxTs: startMs, successful: false }
+    return {
+      incremental: { days: {}, maxTs: startMs, successful: false },
+      recent: reconcileStartMs ? { days: {}, maxTs: reconcileStartMs, successful: false } : null
+    }
   }
 }
 
-function scanClaudeAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
-  return walkJsonl(path.join(os.homedir(), '.claude', 'projects'), filterMtimeMs, (line) => {
+function scanClaudeAggregateAsync(states: Record<string, JsonlFileState>) {
+  return scanJsonlRoot(path.join(os.homedir(), '.claude', 'projects'), 'claude', states, (line) => {
     const trimmed = line.trim()
     if (!trimmed || trimmed[0] !== '{') return null
     try {
@@ -609,8 +549,8 @@ function scanClaudeAggregateAsync(filterMtimeMs: number): Promise<AggregateDays>
   })
 }
 
-function scanPiAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
-  return walkJsonl(path.join(os.homedir(), '.pi', 'agent', 'sessions'), filterMtimeMs, (line) => {
+function scanPiAggregateAsync(states: Record<string, JsonlFileState>) {
+  return scanJsonlRoot(path.join(os.homedir(), '.pi', 'agent', 'sessions'), 'pi', states, (line) => {
     if (!line.includes('totalTokens')) return null
     try {
       const j = JSON.parse(line)
@@ -637,8 +577,8 @@ function scanPiAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
   })
 }
 
-function scanCodexAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
-  return walkJsonl(path.join(os.homedir(), '.codex', 'sessions'), filterMtimeMs, (line) => {
+function scanCodexAggregateAsync(states: Record<string, JsonlFileState>) {
+  return scanJsonlRoot(path.join(os.homedir(), '.codex', 'sessions'), 'codex', states, (line) => {
     if (!line.includes('"token_count"')) return null
     try {
       const j = JSON.parse(line)
@@ -668,8 +608,52 @@ function scanCodexAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> 
   })
 }
 
+function statesForSource(states: Record<string, JsonlFileState>, source: JsonlSource): Record<string, JsonlFileState> {
+  return Object.fromEntries(Object.entries(states).filter(([, state]) => state.source === source))
+}
+
+function daysBefore(source: AggregateDays, date: string): AggregateDays {
+  const result: AggregateDays = {}
+  for (const [key, value] of Object.entries(source)) {
+    if (key < date) result[key] = value
+  }
+  return result
+}
+
+function removeDaysFrom(source: AggregateDays, date: string): void {
+  for (const key of Object.keys(source)) {
+    if (key >= date) delete source[key]
+  }
+}
+
+function applySqliteScan(previous: AggregateDays, scan: SqliteScan, reconcileDate: string): AggregateDays {
+  const next = cloneAggregateDays(previous)
+
+  if (scan.recent?.successful) {
+    removeDaysFrom(next, reconcileDate)
+    mergeAggregateDays(next, scan.recent.days)
+    if (scan.incremental.successful) mergeAggregateDays(next, daysBefore(scan.incremental.days, reconcileDate))
+  } else if (scan.incremental.successful) {
+    mergeAggregateDays(next, scan.incremental.days)
+  }
+
+  return next
+}
+
+function rebuildDaysFromSources(
+  sqliteDays: PersistentStatsCache['sqliteDays'],
+  jsonlFiles: Record<string, JsonlFileState>
+): AggregateDays {
+  const days: AggregateDays = {}
+  mergeAggregateDays(days, sqliteDays.opencode)
+  mergeAggregateDays(days, sqliteDays.zcode)
+  for (const state of Object.values(jsonlFiles)) mergeAggregateDays(days, state.days)
+  return days
+}
+
 /**
- * 增量扫描与持久化合并算法
+ * 可恢复的增量扫描与持久化合并算法。
+ * JSONL 按文件保存贡献，SQLite 增量读取并校准最近两天。
  */
 export async function aggregateFullStats(): Promise<void> {
   if (statsCache.isScanning) return
@@ -677,60 +661,58 @@ export async function aggregateFullStats(): Promise<void> {
 
   try {
     const diskCache = loadPersistentCache()
-    const isFirstTime = Object.keys(diskCache.days).length === 0
+    const isFirstTime = !diskCache.initialized
 
     const now = new Date()
     const startOf90Days = new Date(now.getFullYear(), now.getMonth() - 3, 1).getTime()
+    const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+    const reconcileDate = `${startOfYesterday.getFullYear()}-${String(startOfYesterday.getMonth() + 1).padStart(2, '0')}-${String(startOfYesterday.getDate()).padStart(2, '0')}`
 
-    // 增量起点时间戳
     const opencodeStartTs = isFirstTime ? startOf90Days : (diskCache.watermarks.opencode_max_ts || startOf90Days)
     const zcodeStartTs = isFirstTime ? startOf90Days : (diskCache.watermarks.zcode_max_ts || startOf90Days)
-    const claudeMtime = isFirstTime ? 0 : (diskCache.watermarks.claude_scan_time || 0)
-    const piMtime = isFirstTime ? 0 : (diskCache.watermarks.pi_scan_time || 0)
-    const codexMtime = isFirstTime ? 0 : (diskCache.watermarks.codex_scan_time || 0)
+    const reconcileStartMs = isFirstTime ? undefined : startOfYesterday.getTime() - 1
 
-    const scanStartTime = Date.now()
-
-    // 并发增量采集；每个数据源只保留按天/模型聚合桶。
-    const [opencodeRes, zcodeRes, claudeDays, piDays, codexDays] = await Promise.all([
-      scanOpencodeAggregate(opencodeStartTs),
-      scanZcodeAggregate(zcodeStartTs),
-      scanClaudeAggregateAsync(claudeMtime),
-      scanPiAggregateAsync(piMtime),
-      scanCodexAggregateAsync(codexMtime)
+    const [opencodeRes, zcodeRes, claudeScan, piScan, codexScan] = await Promise.all([
+      scanOpencodeAggregate(opencodeStartTs, reconcileStartMs),
+      scanZcodeAggregate(zcodeStartTs, reconcileStartMs),
+      scanClaudeAggregateAsync(statesForSource(diskCache.jsonlFiles, 'claude')),
+      scanPiAggregateAsync(statesForSource(diskCache.jsonlFiles, 'pi')),
+      scanCodexAggregateAsync(statesForSource(diskCache.jsonlFiles, 'codex'))
     ])
 
-    // 将增量数据合并入缓存字典
-    const daysMap = { ...diskCache.days }
-    mergeAggregateDays(daysMap, opencodeRes.days)
-    mergeAggregateDays(daysMap, zcodeRes.days)
-    mergeAggregateDays(daysMap, claudeDays)
-    mergeAggregateDays(daysMap, piDays)
-    mergeAggregateDays(daysMap, codexDays)
-
-    // 更新水库刻度线
-    const updatedWatermarks = {
-      opencode_max_ts: opencodeRes.successful
-        ? Math.max(diskCache.watermarks.opencode_max_ts || 0, opencodeRes.maxTs)
-        : diskCache.watermarks.opencode_max_ts || 0,
-      zcode_max_ts: zcodeRes.successful
-        ? Math.max(diskCache.watermarks.zcode_max_ts || 0, zcodeRes.maxTs)
-        : diskCache.watermarks.zcode_max_ts || 0,
-      claude_scan_time: scanStartTime,
-      pi_scan_time: scanStartTime,
-      codex_scan_time: scanStartTime
+    const sqliteDays = {
+      opencode: applySqliteScan(diskCache.sqliteDays.opencode, opencodeRes, reconcileDate),
+      zcode: applySqliteScan(diskCache.sqliteDays.zcode, zcodeRes, reconcileDate)
+    }
+    const jsonlFiles: Record<string, JsonlFileState> = { ...diskCache.jsonlFiles }
+    for (const scan of [claudeScan, piScan, codexScan]) {
+      for (const [filePath, state] of Object.entries(scan.states)) jsonlFiles[filePath] = state
     }
 
-    // 重构内存月度数据
+    const daysMap = rebuildDaysFromSources(sqliteDays, jsonlFiles)
+    const updatedWatermarks = {
+      opencode_max_ts: opencodeRes.incremental.successful
+        ? Math.max(diskCache.watermarks.opencode_max_ts || 0, opencodeRes.incremental.maxTs)
+        : diskCache.watermarks.opencode_max_ts || 0,
+      zcode_max_ts: zcodeRes.incremental.successful
+        ? Math.max(diskCache.watermarks.zcode_max_ts || 0, zcodeRes.incremental.maxTs)
+        : diskCache.watermarks.zcode_max_ts || 0,
+      claude_scan_time: diskCache.watermarks.claude_scan_time,
+      pi_scan_time: diskCache.watermarks.pi_scan_time,
+      codex_scan_time: diskCache.watermarks.codex_scan_time
+    }
+
     const { monthMap, todaySummary } = rebuildMonthMapFromDays(daysMap)
     statsCache.months = monthMap
     statsCache.today = todaySummary
     statsCache.lastScanned = Date.now()
 
-    // 持久化保存至磁盘安装目录
     savePersistentCache({
       version: STATS_CACHE_VERSION,
+      initialized: true,
       watermarks: updatedWatermarks,
+      sqliteDays,
+      jsonlFiles,
       days: daysMap
     })
   } catch (err) {

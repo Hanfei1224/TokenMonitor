@@ -4,6 +4,8 @@ import { getStorageDir } from './paths.js'
 
 export interface DeepSeekBalanceData {
   configured: boolean
+  accountId?: string
+  accountName?: string
   is_available?: boolean
   balance?: number
   currency?: string
@@ -20,7 +22,8 @@ function getCacheFilePath(): string {
 
 interface DailyCache {
   date: string
-  startBalance: number
+  startBalance?: number
+  startBalances?: Record<string, number>
 }
 
 function getTodayDateStr(): string {
@@ -28,26 +31,41 @@ function getTodayDateStr(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
-function getOrSetStartBalance(currentBalance: number): number {
+function getOrSetStartBalance(currentBalance: number, accountId = 'default'): number {
   const today = getTodayDateStr()
   const cacheFile = getCacheFilePath()
   try {
     if (fs.existsSync(cacheFile)) {
       const data: DailyCache = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'))
-      if (data.date === today && typeof data.startBalance === 'number' && data.startBalance > 0) {
+      const cachedBalance = data.date === today
+        ? data.startBalances?.[accountId] ?? data.startBalance
+        : undefined
+      if (typeof cachedBalance === 'number' && cachedBalance > 0) {
         // 如果充值导致余额增加，更新今日基准
-        if (currentBalance > data.startBalance) {
-          fs.writeFileSync(cacheFile, JSON.stringify({ date: today, startBalance: currentBalance }), 'utf-8')
+        if (currentBalance > cachedBalance) {
+          fs.writeFileSync(cacheFile, JSON.stringify({
+            date: today,
+            startBalances: { ...(data.startBalances || {}), [accountId]: currentBalance }
+          }), 'utf-8')
           return currentBalance
         }
-        return data.startBalance
+        return cachedBalance
       }
     }
   } catch {}
 
   // 记录今日初始余额
   try {
-    fs.writeFileSync(cacheFile, JSON.stringify({ date: today, startBalance: currentBalance }), 'utf-8')
+    const existing = fs.existsSync(cacheFile)
+      ? JSON.parse(fs.readFileSync(cacheFile, 'utf-8')) as DailyCache
+      : {} as DailyCache
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      date: today,
+      startBalances: {
+        ...(existing.date === today ? existing.startBalances : {}),
+        [accountId]: currentBalance
+      }
+    }), 'utf-8')
   } catch {}
   return currentBalance
 }
@@ -63,7 +81,7 @@ async function readJson<T>(response: Response, signal?: AbortSignal): Promise<T>
   return data
 }
 
-export async function fetchDeepSeekBalance(apiKey: string, signal?: AbortSignal): Promise<DeepSeekBalanceData> {
+export async function fetchDeepSeekBalance(apiKey: string, signal?: AbortSignal, accountId?: string): Promise<DeepSeekBalanceData> {
   throwIfAborted(signal)
   if (!apiKey) {
     return { configured: false }
@@ -95,7 +113,7 @@ export async function fetchDeepSeekBalance(apiKey: string, signal?: AbortSignal)
     }
 
     const totalBalance = parseFloat(info.total_balance || '0')
-    const startBalance = getOrSetStartBalance(totalBalance)
+    const startBalance = getOrSetStartBalance(totalBalance, accountId)
 
     let usedPercent = 0
     if (startBalance > 0 && totalBalance <= startBalance) {

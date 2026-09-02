@@ -43,9 +43,9 @@ export default function App() {
       setIsClickThrough(!!cfg.clickThrough)
     })
 
-    const unsubUsage = window.electronAPI.onUsageUpdate((data) => {
+    const unsubUsage = window.electronAPI.onUsageUpdate((data, complete = true) => {
       setUsageData(data)
-      setIsRefreshing(false)
+      if (complete) setIsRefreshing(false)
     })
 
     const unsubClickThrough = window.electronAPI.onClickThroughChanged((nextVal) => {

@@ -47,15 +47,15 @@ export const RingProgress: React.FC<RingProgressProps> = ({
       const diffMs = d.getTime() - now.getTime()
       if (diffMs <= 0) return '即将重置'
       const diffMin = Math.max(1, Math.ceil(diffMs / 60000))
-      if (label === '5H余额') {
-        const hours = Math.floor(diffMin / 60)
-        const mins = diffMin % 60
-        return `${hours}时${mins}分`
-      }
-      if (label === '本周余额' || label === '本月余额') {
+      if (diffMin >= 24 * 60) {
         const days = Math.floor(diffMin / (24 * 60))
         const hours = Math.floor((diffMin % (24 * 60)) / 60)
         return `${days}天${hours}时`
+      }
+      if (diffMin >= 60) {
+        const hours = Math.floor(diffMin / 60)
+        const mins = diffMin % 60
+        return `${hours}时${mins}分`
       }
       return `${diffMin}分`
     } catch {

@@ -4,7 +4,7 @@ import path from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
 import { app, safeStorage, shell } from 'electron'
 import { parseCodexUsage, CodexQuotaData } from './codexUsage.js'
-import { loadConfig, saveConfig } from './store.js'
+import { deleteAccount, loadConfig, saveConfig } from './store.js'
 
 const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const CODEX_AUTH_URL = 'https://auth.openai.com/oauth/authorize'
@@ -25,6 +25,7 @@ interface StoredCodexAuth {
 interface CodexSession extends StoredCodexAuth {
   accessToken: string
   expiresAt: number
+  encrypted?: string
 }
 
 export interface CodexAuthStatus {
@@ -34,7 +35,8 @@ export interface CodexAuthStatus {
 }
 
 let session: CodexSession | null = null
-let refreshInFlight: { refreshToken: string; promise: Promise<CodexSession> } | null = null
+const sessions = new Map<string, CodexSession>()
+const refreshInFlight = new Map<string, Promise<CodexSession>>()
 let activeServer: http.Server | null = null
 let cancelActiveLogin: (() => void) | null = null
 let authRevision = 0
@@ -72,12 +74,41 @@ function encodeStoredAuth(auth: StoredCodexAuth): string {
   return safeStorage.encryptString(JSON.stringify(auth)).toString('base64')
 }
 
-function writeStoredAuth(auth: StoredCodexAuth): void {
+function writeStoredAuth(auth: StoredCodexAuth, localAccountId?: string): string {
   const encrypted = encodeStoredAuth(auth)
-  const updated = saveConfig({ codexAuth: { encrypted } })
-  if (updated.codexAuth?.encrypted !== encrypted) {
+  const current = loadConfig()
+  const accounts = [...(current.codexAccounts || [])]
+  const targetId = localAccountId || current.activeAccountIds?.codex
+  const activeIndex = accounts.findIndex((account) => account.id === targetId)
+  if (activeIndex >= 0) {
+    accounts[activeIndex] = {
+      ...accounts[activeIndex],
+      encrypted,
+      email: auth.email || accounts[activeIndex].email
+    }
+  } else {
+    accounts.push({ id: 'legacy-codex', encrypted, email: auth.email })
+  }
+  const isActiveAccount = activeIndex >= 0 && accounts[activeIndex].id === current.activeAccountIds?.codex
+  const activeAccountId = current.activeAccountIds?.codex || accounts[activeIndex >= 0 ? activeIndex : accounts.length - 1]?.id
+  const updated = saveConfig({
+    codexAccounts: accounts,
+    activeAccountIds: activeAccountId
+      ? { ...(current.activeAccountIds || {}), codex: activeAccountId }
+      : current.activeAccountIds,
+    ...(isActiveAccount ? { codexAuth: { encrypted } } : {})
+  })
+  if (isActiveAccount && updated.codexAuth?.encrypted !== encrypted) {
     throw new Error('ChatGPT 授权未能写入 config.json')
   }
+  return encrypted
+}
+
+export function invalidateCodexSession(): void {
+  authRevision += 1
+  session = null
+  sessions.clear()
+  refreshInFlight.clear()
 }
 
 function readStoredAuth(): { auth: StoredCodexAuth | null; error?: string } {
@@ -108,12 +139,6 @@ function readStoredAuth(): { auth: StoredCodexAuth | null; error?: string } {
   } catch {
     return { auth: null, error: '本地 ChatGPT 授权凭证无法读取' }
   }
-}
-
-function removeStoredAuth(): void {
-  const updated = saveConfig({ codexAuth: undefined })
-  if (updated.codexAuth) throw new Error('ChatGPT 授权未能从 config.json 移除')
-  fs.rmSync(legacyAuthFilePath(), { force: true })
 }
 
 function jwtClaims(token: string): Record<string, unknown> {
@@ -159,6 +184,16 @@ function tokenExpiry(accessToken: string, expiresIn: unknown): number {
 
 function sessionIsUsable(value: CodexSession): boolean {
   return value.expiresAt > Date.now() + 60_000
+}
+
+function pruneExpiredSessions(): void {
+  const now = Date.now()
+  for (const [refreshToken, value] of sessions) {
+    if (value.expiresAt <= now) {
+      sessions.delete(refreshToken)
+      if (session === value) session = null
+    }
+  }
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -237,19 +272,21 @@ async function exchangeCode(code: string, verifier: string, redirectUri: string)
       ...metadata
     }
     if (revision !== authRevision) throw new Error('登录状态已变更，请重试')
-    writeStoredAuth({
+    const storedAuth = {
       refreshToken: nextSession.refreshToken,
       accountId: nextSession.accountId,
       email: nextSession.email
-    })
+    }
+    const encrypted = encodeStoredAuth(storedAuth)
+    sessions.set(nextSession.refreshToken, nextSession)
     session = nextSession
-    return nextSession
+    return { ...nextSession, encrypted }
   } finally {
     request.cleanup()
   }
 }
 
-async function refreshSession(source: StoredCodexAuth, parentSignal?: AbortSignal): Promise<CodexSession> {
+async function refreshSession(source: StoredCodexAuth, localAccountId: string | undefined, parentSignal?: AbortSignal): Promise<CodexSession> {
   const revision = authRevision
   const request = createRequestSignal(parentSignal)
   try {
@@ -286,7 +323,9 @@ async function refreshSession(source: StoredCodexAuth, parentSignal?: AbortSigna
       refreshToken: nextSession.refreshToken,
       accountId: nextSession.accountId,
       email: nextSession.email
-    })
+    }, localAccountId)
+    sessions.delete(source.refreshToken)
+    sessions.set(nextSession.refreshToken, nextSession)
     session = nextSession
     return nextSession
   } finally {
@@ -294,31 +333,28 @@ async function refreshSession(source: StoredCodexAuth, parentSignal?: AbortSigna
   }
 }
 
-function refreshSessionOnce(source: StoredCodexAuth, parentSignal?: AbortSignal): Promise<CodexSession> {
-  if (session && session.refreshToken !== source.refreshToken) {
-    if (sessionIsUsable(session)) return Promise.resolve(session)
-    return refreshSessionOnce(session, parentSignal)
-  }
-  if (refreshInFlight?.refreshToken === source.refreshToken) return refreshInFlight.promise
+function refreshSessionOnce(source: StoredCodexAuth, localAccountId?: string, parentSignal?: AbortSignal): Promise<CodexSession> {
+  const pending = refreshInFlight.get(source.refreshToken)
+  if (pending) return pending
 
-  const promise = refreshSession(source, parentSignal)
-  const pending = { refreshToken: source.refreshToken, promise }
-  refreshInFlight = pending
+  const promise = refreshSession(source, localAccountId, parentSignal)
+  refreshInFlight.set(source.refreshToken, promise)
   void promise.then(
     () => {
-      if (refreshInFlight === pending) refreshInFlight = null
+      if (refreshInFlight.get(source.refreshToken) === promise) refreshInFlight.delete(source.refreshToken)
     },
     () => {
-      if (refreshInFlight === pending) refreshInFlight = null
+      if (refreshInFlight.get(source.refreshToken) === promise) refreshInFlight.delete(source.refreshToken)
     }
   )
   return promise
 }
 
-async function ensureSession(stored: StoredCodexAuth, signal?: AbortSignal): Promise<CodexSession> {
+async function ensureSession(stored: StoredCodexAuth, localAccountId?: string, signal?: AbortSignal): Promise<CodexSession> {
   throwIfAborted(signal)
-  if (session && session.refreshToken === stored.refreshToken && sessionIsUsable(session)) return session
-  return refreshSessionOnce(session && session.refreshToken === stored.refreshToken ? session : stored, signal)
+  const cached = sessions.get(stored.refreshToken)
+  if (cached && sessionIsUsable(cached)) return cached
+  return refreshSessionOnce(stored, localAccountId, signal)
 }
 
 async function requestUsage(current: CodexSession, parentSignal?: AbortSignal): Promise<{
@@ -357,22 +393,21 @@ export function getCodexAuthStatus(): CodexAuthStatus {
   }
 }
 
-export async function fetchCodexQuota(signal?: AbortSignal): Promise<CodexQuotaData> {
+async function fetchCodexQuotaForAuth(
+  stored: StoredCodexAuth,
+  localAccountId?: string,
+  signal?: AbortSignal
+): Promise<CodexQuotaData> {
   throwIfAborted(signal)
-  const stored = readStoredAuth()
-  if (!stored.auth) {
-    throwIfAborted(signal)
-    return { configured: false, error: stored.error || null }
-  }
-
+  pruneExpiredSessions()
   try {
-    let current = await ensureSession(stored.auth, signal)
+    let current = await ensureSession(stored, localAccountId, signal)
     let usageRequest = await requestUsage(current, signal)
 
     try {
       if (usageRequest.response.status === 401) {
         usageRequest.cleanup()
-        current = await refreshSessionOnce(current, signal)
+        current = await refreshSessionOnce(current, localAccountId, signal)
         usageRequest = await requestUsage(current, signal)
       }
 
@@ -380,7 +415,7 @@ export async function fetchCodexQuota(signal?: AbortSignal): Promise<CodexQuotaD
       if (!response.ok) {
         return {
           configured: true,
-          email: current.email || stored.auth.email,
+          email: current.email || stored.email,
           error: response.status === 403
             ? 'ChatGPT 账号无权读取 Codex 额度'
             : `Codex 额度接口 HTTP ${response.status}`
@@ -394,7 +429,7 @@ export async function fetchCodexQuota(signal?: AbortSignal): Promise<CodexQuotaD
         throwIfAborted(signal)
         throw new Error('Codex 额度返回格式异常')
       }
-      const parsed = parseCodexUsage(payload, current.email || stored.auth.email)
+      const parsed = parseCodexUsage(payload, current.email || stored.email)
       return {
         ...parsed,
         configured: true,
@@ -407,10 +442,32 @@ export async function fetchCodexQuota(signal?: AbortSignal): Promise<CodexQuotaD
     throwIfAborted(signal)
     return {
       configured: true,
-      email: session?.email || stored.auth.email,
+      email: stored.email,
       error: safeErrorMessage(err, 'Codex 网络连接异常')
     }
   }
+}
+
+export async function fetchCodexQuota(signal?: AbortSignal): Promise<CodexQuotaData> {
+  const stored = readStoredAuth()
+  if (!stored.auth) {
+    throwIfAborted(signal)
+    return { configured: false, error: stored.error || null }
+  }
+  return fetchCodexQuotaForAuth(stored.auth, loadConfig().activeAccountIds?.codex, signal)
+}
+
+export async function fetchCodexQuotaForAccount(
+  encrypted: string,
+  localAccountId: string,
+  signal?: AbortSignal
+): Promise<CodexQuotaData> {
+  throwIfAborted(signal)
+  const stored = decryptStoredAuth(encrypted)
+  if (!stored.auth) {
+    return { configured: true, error: stored.error || '本地 ChatGPT 授权无法读取' }
+  }
+  return fetchCodexQuotaForAuth(stored.auth, localAccountId, signal)
 }
 
 function htmlResponse(res: http.ServerResponse, status: number, body: string): void {
@@ -461,7 +518,7 @@ async function listenOnPort(handler: http.RequestListener): Promise<{ server: ht
   throw lastError instanceof Error ? lastError : new Error('无法启动 ChatGPT OAuth 回调服务')
 }
 
-export function startCodexOAuth(): Promise<{ success: boolean; email?: string; error?: string }> {
+export function startCodexOAuth(options: { persist?: boolean } = {}): Promise<{ success: boolean; email?: string; encrypted?: string; error?: string }> {
   cancelActiveLogin?.()
   authRevision += 1
 
@@ -471,7 +528,7 @@ export function startCodexOAuth(): Promise<{ success: boolean; email?: string; e
     let server: http.Server | null = null
     let loginTimer: ReturnType<typeof setTimeout> | null = null
     let cancel: () => void
-    const finish = (result: { success: boolean; email?: string; error?: string }) => {
+    const finish = (result: { success: boolean; email?: string; encrypted?: string; error?: string }) => {
       if (settled) return
       settled = true
       if (!result.success) authRevision += 1
@@ -534,8 +591,15 @@ export function startCodexOAuth(): Promise<{ success: boolean; email?: string; e
       try {
         const redirectUri = `http://localhost:${callbackPort}${CODEX_REDIRECT_PATH}`
         const nextSession = await exchangeCode(url.searchParams.get('code') as string, verifier, redirectUri)
+        if (options.persist !== false && nextSession.encrypted) {
+          writeStoredAuth({
+            refreshToken: nextSession.refreshToken,
+            accountId: nextSession.accountId,
+            email: nextSession.email
+          })
+        }
         htmlResponse(res, 200, loginPage(true))
-        finish({ success: true, email: nextSession.email })
+        finish({ success: true, email: nextSession.email, encrypted: nextSession.encrypted })
       } catch (err) {
         htmlResponse(res, 500, loginPage(false))
         finish({ success: false, error: safeErrorMessage(err, 'ChatGPT OAuth 登录失败') })
@@ -578,15 +642,18 @@ export function startCodexOAuth(): Promise<{ success: boolean; email?: string; e
   })
 }
 
-export function logoutCodexOAuth(): { success: boolean; error?: string } {
+export function logoutCodexOAuth(accountId?: string): { success: boolean; error?: string } {
   cancelActiveLogin?.()
   authRevision += 1
   session = null
-  refreshInFlight = null
+  sessions.clear()
+  refreshInFlight.clear()
   activeServer?.close()
   activeServer = null
   try {
-    removeStoredAuth()
+    const targetId = accountId || loadConfig().activeAccountIds?.codex
+    if (targetId) deleteAccount('codex', targetId)
+    fs.rmSync(legacyAuthFilePath(), { force: true })
     return { success: true }
   } catch (err) {
     return { success: false, error: safeErrorMessage(err, '退出 ChatGPT 授权失败') }

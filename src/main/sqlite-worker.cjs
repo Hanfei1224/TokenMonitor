@@ -94,7 +94,18 @@ function existingPath(paths) {
   return paths.find((value) => typeof value === 'string' && fs.existsSync(value)) || null
 }
 
-function queryDatabase(dbPath, sql, startMs) {
+function queryAggregate(db, sql, startMs) {
+  const aggregates = db.prepare(sql).all(startMs)
+  let maxTs = startMs
+  for (const aggregate of aggregates) {
+    if (Number.isFinite(Number(aggregate.max_ts))) {
+      maxTs = Math.max(maxTs, Number(aggregate.max_ts))
+    }
+  }
+  return { maxTs, aggregates }
+}
+
+function queryDatabase(dbPath, sql, startMs, reconcileStartMs) {
   if (!dbPath) return emptyResult(startMs)
 
   let db
@@ -102,14 +113,12 @@ function queryDatabase(dbPath, sql, startMs) {
     db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5000 })
     db.pragma('cache_size = -8192')
     db.pragma('temp_store = FILE')
-    const aggregates = db.prepare(sql).all(startMs)
-    let maxTs = startMs
-    for (const aggregate of aggregates) {
-      if (Number.isFinite(Number(aggregate.max_ts))) {
-        maxTs = Math.max(maxTs, Number(aggregate.max_ts))
-      }
+    const result = queryAggregate(db, sql, startMs)
+    if (!Number.isFinite(reconcileStartMs)) return result
+    return {
+      ...result,
+      recent: queryAggregate(db, sql, reconcileStartMs)
     }
-    return { maxTs, aggregates }
   } finally {
     if (db) db.close()
   }
@@ -117,12 +126,13 @@ function queryDatabase(dbPath, sql, startMs) {
 
 function query(payload) {
   const startMs = Number.isFinite(Number(payload.startMs)) ? Number(payload.startMs) : 0
+  const reconcileStartMs = Number.isFinite(Number(payload.reconcileStartMs)) ? Number(payload.reconcileStartMs) : undefined
   if (payload.kind === 'opencode') {
     const dbPath = existingPath(Array.isArray(payload.dbPaths) ? payload.dbPaths : [])
-    return queryDatabase(dbPath, OPENCODE_SQL, startMs)
+    return queryDatabase(dbPath, OPENCODE_SQL, startMs, reconcileStartMs)
   }
   if (payload.kind === 'zcode') {
-    return queryDatabase(typeof payload.dbPath === 'string' && fs.existsSync(payload.dbPath) ? payload.dbPath : null, ZCODE_SQL, startMs)
+    return queryDatabase(typeof payload.dbPath === 'string' && fs.existsSync(payload.dbPath) ? payload.dbPath : null, ZCODE_SQL, startMs, reconcileStartMs)
   }
   throw new Error('unknown sqlite worker query kind')
 }

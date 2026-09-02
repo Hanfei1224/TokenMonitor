@@ -2,11 +2,22 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { app, BrowserWindow, ipcMain, screen, nativeImage, globalShortcut } from 'electron'
-import { loadConfig, saveConfig } from './store.js'
+import {
+  addCodexAccount,
+  addGeminiAccount,
+  deleteAccount,
+  getAccountState,
+  loadConfig,
+  renameAccount,
+  saveApiAccount,
+  saveConfig,
+  setActiveAccount,
+  ProviderId
+} from './store.js'
 import { getStorageDir } from './paths.js'
-import { fetchMultiPlanUsage, MultiPlanUsageData } from './usage.js'
+import { AccountUsageProgress, AccountUsageValue, fetchMultiPlanUsage, MultiPlanUsageData } from './usage.js'
 import { startGoogleOAuth } from './geminiAuth.js'
-import { getCodexAuthStatus, logoutCodexOAuth, startCodexOAuth } from './codexAuth.js'
+import { getCodexAuthStatus, invalidateCodexSession, startCodexOAuth } from './codexAuth.js'
 import { createTray } from './tray.js'
 import { startStatsBackgroundScanner, stopStatsBackgroundScanner, getCachedTodayStats, getCachedMonthStats } from './stats.js'
 
@@ -59,7 +70,38 @@ let currentUsageData: MultiPlanUsageData = {
   deepseek: { configured: false },
   gemini: { configured: false },
   codex: { configured: false },
+  accountUsage: {
+    opencode: {},
+    deepseek: {},
+    gemini: {},
+    codex: {}
+  },
   error: 'initializing'
+}
+
+function mergeAccountUsage(
+  base: MultiPlanUsageData,
+  provider: ProviderId,
+  accountId: string,
+  usage: AccountUsageValue,
+  isActive: boolean
+): MultiPlanUsageData {
+  const next: MultiPlanUsageData = {
+    ...base,
+    accountUsage: {
+      ...base.accountUsage,
+      [provider]: {
+        ...base.accountUsage[provider],
+        [accountId]: usage
+      }
+    } as MultiPlanUsageData['accountUsage']
+  }
+
+  if (isActive && provider === 'opencode') next.opencode = usage as MultiPlanUsageData['opencode']
+  if (isActive && provider === 'deepseek') next.deepseek = usage as MultiPlanUsageData['deepseek']
+  if (isActive && provider === 'gemini') next.gemini = usage as MultiPlanUsageData['gemini']
+  if (isActive && provider === 'codex') next.codex = usage as MultiPlanUsageData['codex']
+  return next
 }
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
@@ -294,8 +336,13 @@ function clearPollTimer(): void {
   pollTimer = null
 }
 
-function scheduleNextPoll(): Promise<void> {
-  if (pollInFlight) return pollInFlight
+function scheduleNextPoll(force = false): Promise<void> {
+  if (pollInFlight) {
+    if (!force) return pollInFlight
+    const previous = pollInFlight
+    pollController?.abort(new Error('配置已变更'))
+    return previous.then(() => scheduleNextPoll())
+  }
   clearPollTimer()
 
   const controller = new AbortController()
@@ -309,13 +356,26 @@ function scheduleNextPoll(): Promise<void> {
     try {
       const cfg = loadConfig()
       const todayStats = getCachedTodayStats()
-      const nextUsageData = await fetchMultiPlanUsage(cfg, todayStats, controller.signal)
+      let progressUsage = currentUsageData
+      const onAccountUsage: AccountUsageProgress = (provider, accountId, usage) => {
+        if (controller.signal.aborted) return
+        progressUsage = mergeAccountUsage(
+          progressUsage,
+          provider,
+          accountId,
+          usage,
+          cfg.activeAccountIds?.[provider] === accountId
+        )
+        currentUsageData = progressUsage
+        mainWindow?.webContents.send('usage-update', currentUsageData, false)
+      }
+      const nextUsageData = await fetchMultiPlanUsage(cfg, todayStats, controller.signal, onAccountUsage)
       if (!controller.signal.aborted) {
         currentUsageData = nextUsageData
-        mainWindow?.webContents.send('usage-update', currentUsageData)
+        mainWindow?.webContents.send('usage-update', currentUsageData, true)
       }
     } catch (err) {
-      if (!isQuitting) console.error('Fetch multi plan usage error:', err)
+      if (!controller.signal.aborted && !isQuitting) console.error('Fetch multi plan usage error:', err)
     } finally {
       clearTimeout(timeoutTimer)
       if (pollController === controller) pollController = null
@@ -347,7 +407,19 @@ function stopPolling(): void {
   controller?.abort(new Error('应用退出'))
 }
 
-ipcMain.handle('get-config', () => loadConfig())
+function getSafeConfig(cfg: ReturnType<typeof loadConfig>) {
+  return {
+    alwaysOnTop: cfg.alwaysOnTop,
+    clickThrough: cfg.clickThrough,
+    windowPosition: cfg.windowPosition,
+    activePlanIndex: cfg.activePlanIndex,
+    activeAccountIds: cfg.activeAccountIds
+  }
+}
+
+ipcMain.handle('get-config', () => {
+  return getSafeConfig(loadConfig())
+})
 ipcMain.handle('save-config', (_event, newCfg) => {
   const updated = saveConfig(newCfg)
   if (mainWindow) {
@@ -357,7 +429,7 @@ ipcMain.handle('save-config', (_event, newCfg) => {
     }
   }
   startPolling()
-  return updated
+  return getSafeConfig(updated)
 })
 
 ipcMain.handle('fetch-usage-now', async () => {
@@ -373,39 +445,73 @@ ipcMain.handle('get-calendar-stats', (_event, year: number, month: number) => {
   return getCachedMonthStats(year, month)
 })
 
+ipcMain.handle('get-account-state', () => getAccountState())
+
+ipcMain.handle('save-api-account', (_event, provider, name, apiKey, accountId) => {
+  if (provider !== 'opencode' && provider !== 'deepseek') throw new Error('不支持的 API 通道')
+  const state = saveApiAccount(provider, name, apiKey, accountId || undefined)
+  void scheduleNextPoll(true)
+  return state
+})
+
+ipcMain.handle('rename-account', (_event, provider, accountId, name) => {
+  const state = renameAccount(provider, accountId, name)
+  return state
+})
+
+ipcMain.handle('delete-account', (_event, provider, accountId) => {
+  if (provider === 'codex') invalidateCodexSession()
+  const state = deleteAccount(provider, accountId)
+  void scheduleNextPoll(true)
+  return state
+})
+
+ipcMain.handle('set-active-account', async (_event, provider, accountId) => {
+  return setActiveAccount(provider, accountId)
+})
+
 ipcMain.handle('prepare-overlay', () => {})
 ipcMain.handle('reveal-overlay', () => {})
 
 ipcMain.handle('start-google-oauth', async () => {
   const res = await startGoogleOAuth()
-  if (res.success) {
-    await scheduleNextPoll()
+  if (!res.success) return res
+  if (!res.refreshToken) return { success: false, error: 'Google 登录未返回授权凭证' }
+  const account = addGeminiAccount(res.refreshToken, res.email)
+  await scheduleNextPoll(true)
+  return {
+    success: true,
+    email: account.email,
+    accountId: account.id
   }
-  return res
 })
 
-ipcMain.handle('logout-google-oauth', async () => {
-  saveConfig({ geminiRefreshToken: '', geminiAccountEmail: '' })
-  await scheduleNextPoll()
-  return { success: true }
+ipcMain.handle('logout-google-oauth', async (_event, accountId) => {
+  const state = deleteAccount('gemini', accountId)
+  await scheduleNextPoll(true)
+  return { success: true, state }
 })
 
 ipcMain.handle('get-codex-auth-status', () => getCodexAuthStatus())
 
 ipcMain.handle('start-codex-oauth', async () => {
-  const res = await startCodexOAuth()
-  if (res.success) {
-    void scheduleNextPoll()
+  const res = await startCodexOAuth({ persist: false })
+  if (!res.success) return res
+  if (!res.encrypted) return { success: false, error: 'ChatGPT 登录未返回授权凭证' }
+  const account = addCodexAccount(res.encrypted, res.email)
+  void scheduleNextPoll(true)
+  return {
+    success: true,
+    email: account.email,
+    accountId: account.id
   }
-  return res
 })
 
-ipcMain.handle('logout-codex-oauth', async () => {
-  const res = logoutCodexOAuth()
-  if (res.success) {
-    void scheduleNextPoll()
-  }
-  return res
+ipcMain.handle('logout-codex-oauth', async (_event, accountId) => {
+  invalidateCodexSession()
+  const state = deleteAccount('codex', accountId)
+  void scheduleNextPoll(true)
+  return { success: true, state }
 })
 
 ipcMain.on('open-settings-window', () => {

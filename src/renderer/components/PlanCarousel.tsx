@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Bot, ChevronLeft, ChevronRight, Key, ShieldCheck } from 'lucide-react'
+import { Bot, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Key, Loader2, ShieldCheck } from 'lucide-react'
 import { RingProgress } from './RingProgress.js'
-import { MultiPlanUsageData } from '../types.js'
+import { AccountState, MultiPlanUsageData, ProviderId } from '../types.js'
 
 interface PlanCarouselProps {
   data: MultiPlanUsageData | null
@@ -11,27 +11,25 @@ interface PlanCarouselProps {
 
 export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings }) => {
   const [currentIndex, setCurrentIndex] = useState(3)
+  const [accountState, setAccountState] = useState<AccountState | null>(null)
+  const [isSwitchingAccount, setIsSwitchingAccount] = useState(false)
 
-  const plans = [
+  const plans: Array<{ id: ProviderId; name: string }> = [
     {
       id: 'opencode',
-      name: 'OpenCode Go',
-      type: 'rolling'
+      name: 'OpenCode Go'
     },
     {
       id: 'deepseek',
-      name: 'DeepSeek 官方',
-      type: 'balance'
+      name: 'DeepSeek 官方'
     },
     {
       id: 'gemini',
-      name: 'Gemini Pro (Google)',
-      type: 'oauth'
+      name: 'Google Gemini'
     },
     {
       id: 'codex',
-      name: 'GPT',
-      type: 'oauth'
+      name: 'OpenAI GPT'
     }
   ]
 
@@ -43,6 +41,7 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
           setCurrentIndex(cfg.activePlanIndex)
         }
       })
+      window.electronAPI.getAccountState().then(setAccountState)
     }
   }, [])
 
@@ -66,6 +65,33 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
   }
 
   const currentPlan = plans[currentIndex]
+  const currentProvider = currentPlan.id
+  const currentAccounts = accountState?.accounts[currentProvider] || []
+  const currentProviderData = data?.[currentProvider]
+  const selectedAccountId = accountState?.activeAccountIds[currentProvider]
+    || currentProviderData?.accountId
+    || currentAccounts[0]?.id
+  const currentData = data?.accountUsage?.[currentProvider]?.[selectedAccountId || ''] || currentProviderData
+  const selectedAccountIndex = currentAccounts.findIndex((account) => account.id === selectedAccountId)
+  const selectedAccount = selectedAccountIndex >= 0 ? currentAccounts[selectedAccountIndex] : undefined
+  const selectedAccountEmail = selectedAccount?.email || (currentData && 'email' in currentData ? currentData.email : undefined)
+  const selectedAccountName = selectedAccount?.name || currentData?.accountName || selectedAccountEmail
+
+  const handleAccountSwitch = async (direction: -1 | 1) => {
+    if (!window.electronAPI || currentAccounts.length < 2 || isSwitchingAccount) return
+    const currentIdx = selectedAccountIndex >= 0 ? selectedAccountIndex : 0
+    const nextIdx = (currentIdx + direction + currentAccounts.length) % currentAccounts.length
+    const nextAccount = currentAccounts[nextIdx]
+    setIsSwitchingAccount(true)
+    try {
+      const nextState = await window.electronAPI.setActiveAccount(currentProvider, nextAccount.id)
+      setAccountState(nextState)
+    } catch (err) {
+      console.error('切换账号失败:', err)
+    } finally {
+      setIsSwitchingAccount(false)
+    }
+  }
 
   const formatPlanType = (planType?: string) => {
     if (!planType) return 'ChatGPT'
@@ -82,11 +108,26 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
     return labels[planType.toLowerCase()] || planType
   }
 
+  const planBadgeClass = (planType?: string) => {
+    switch (planType?.toLowerCase()) {
+      case 'ultra': return 'text-fuchsia-300'
+      case 'pro': return 'text-violet-300'
+      case 'prolite': return 'text-sky-300'
+      case 'plus': return 'text-emerald-300'
+      case 'team': return 'text-amber-300'
+      case 'business': return 'text-orange-300'
+      case 'enterprise': return 'text-rose-300'
+      case 'standard': return 'text-cyan-300'
+      case 'free': return 'text-white/50'
+      default: return 'text-white/50'
+    }
+  }
+
   const currentPlanName = currentPlan.name
 
   // 1. 渲染 OpenCode Go（统一为剩余百分比：100 - usedPercent）
   const renderOpenCode = () => {
-    const opencode = data?.opencode
+    const opencode = data?.accountUsage?.opencode?.[selectedAccountId || ''] || data?.opencode
     if (!opencode?.configured) {
       return (
         <div className="flex flex-col items-center justify-center h-full gap-2 text-white/50">
@@ -139,7 +180,7 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
 
   // 2. 渲染 DeepSeek（保持不变写今日消耗百分比）
   const renderDeepSeek = () => {
-    const deepseek = data?.deepseek
+    const deepseek = data?.accountUsage?.deepseek?.[selectedAccountId || ''] || data?.deepseek
     if (!deepseek?.configured) {
       return (
         <div className="flex flex-col items-center justify-center h-full gap-2 text-white/50">
@@ -190,9 +231,9 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
     )
   }
 
-  // 3. 渲染 Gemini Pro（Gemini 剩余 + Claude 剩余双池子，完整展示重置时间与邮箱）
+  // 3. 渲染 Google Gemini（Gemini 剩余 + Claude 剩余双池子）
   const renderGemini = () => {
-    const gemini = data?.gemini
+    const gemini = data?.accountUsage?.gemini?.[selectedAccountId || ''] || data?.gemini
     if (!gemini?.configured) {
       return (
         <div className="flex flex-col items-center justify-center h-full gap-2 text-white/50">
@@ -233,19 +274,13 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
           />
         </div>
 
-        {/* 底部绑定邮箱（自然换行、给足空间） */}
-        <div className="w-full text-center px-1">
-          <span className="text-[10px] text-purple-200/70 break-all leading-tight">
-            {gemini.email || '已绑定 Google 账号'}
-          </span>
-        </div>
       </div>
     )
   }
 
   // 4. 渲染 Codex（只展示接口实际返回的窗口）
   const renderCodex = () => {
-    const codex = data?.codex
+    const codex = data?.accountUsage?.codex?.[selectedAccountId || ''] || data?.codex
     if (!codex?.configured) {
       return (
         <div className="flex flex-col items-center justify-center h-full gap-2 text-white/50">
@@ -278,11 +313,7 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
 
     const windows = codex.windows || []
     return (
-      <div className="flex flex-col w-full h-full justify-between py-0.5">
-        <div className="flex items-center justify-between px-1 text-[10px]">
-          <span className="text-emerald-400 font-semibold">{formatPlanType(codex.planType)}</span>
-          <span className="text-white/40 truncate max-w-[150px]">{codex.email || 'ChatGPT 账号'}</span>
-        </div>
+      <div className="flex flex-col w-full h-full justify-center py-0.5">
         {windows.length > 0 ? (
           <div className="flex items-center justify-around w-full">
             {windows.map((window) => (
@@ -320,7 +351,52 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
             />
           ))}
         </div>
-      </div>
+        </div>
+
+      <div className="flex h-5 items-center justify-center gap-1 shrink-0 text-[10px] text-white/65">
+        {selectedAccountName && (
+          <>
+          {currentProvider === 'gemini' && (data?.accountUsage?.gemini?.[selectedAccountId || ''] || data?.gemini)?.planType && (
+            <span className={`shrink-0 font-semibold ${planBadgeClass((data?.accountUsage?.gemini?.[selectedAccountId || ''] || data?.gemini)?.planType)}`}>
+              {(data?.accountUsage?.gemini?.[selectedAccountId || ''] || data?.gemini)?.planType}
+            </span>
+          )}
+          {currentProvider === 'codex' && (
+            <span className={`shrink-0 font-semibold ${planBadgeClass((data?.accountUsage?.codex?.[selectedAccountId || ''] || data?.codex)?.planType)}`}>
+              {formatPlanType((data?.accountUsage?.codex?.[selectedAccountId || ''] || data?.codex)?.planType)}
+            </span>
+          )}
+          {currentAccounts.length > 1 && (
+            <button
+              onClick={() => void handleAccountSwitch(-1)}
+              disabled={isSwitchingAccount}
+              title="上一个账号 / API"
+              className="rounded-md p-0.5 text-white/50 hover:bg-white/10 hover:text-white hover:drop-shadow-[0_0_6px_rgba(255,255,255,0.7)] disabled:opacity-40"
+            >
+              <ChevronUp className="h-3.5 w-3.5" />
+            </button>
+          )}
+          <span className="flex max-w-[165px] min-w-0 items-baseline truncate" title={selectedAccountEmail || selectedAccountName}>
+            <span className="truncate">{selectedAccountName}</span>
+            {selectedAccountEmail && selectedAccountName !== selectedAccountEmail && (
+              <span className="ml-1 max-w-[90px] truncate text-white/35">({selectedAccountEmail})</span>
+            )}
+            {currentAccounts.length > 1 && ` ${Math.max(1, selectedAccountIndex + 1)}/${currentAccounts.length}`}
+          </span>
+          {currentAccounts.length > 1 && (
+            <button
+              onClick={() => void handleAccountSwitch(1)}
+              disabled={isSwitchingAccount}
+              title="下一个账号 / API"
+              className="rounded-md p-0.5 text-white/50 hover:bg-white/10 hover:text-white hover:drop-shadow-[0_0_6px_rgba(255,255,255,0.7)] disabled:opacity-40"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {isSwitchingAccount && <Loader2 className="h-3 w-3 animate-spin text-blue-300" />}
+          </>
+        )}
+        </div>
 
       {/* 主展示区 */}
       <div className="relative flex-1 min-h-0 flex items-center justify-center">
@@ -344,14 +420,14 @@ export const PlanCarousel: React.FC<PlanCarouselProps> = ({ data, onOpenSettings
         <button
           onClick={handlePrev}
           title="上一页"
-          className="absolute -left-1 top-1/2 -translate-y-1/2 p-1 rounded-full glass-button-pure text-white/50 hover:text-white opacity-0 group-hover:opacity-100 transition-all z-10"
+          className="absolute -left-1 top-1/2 h-6 w-6 -translate-y-1/2 flex items-center justify-center p-0 rounded-full text-white/50 hover:bg-white/10 hover:text-white hover:drop-shadow-[0_0_6px_rgba(255,255,255,0.7)] opacity-0 group-hover:opacity-100 transition-opacity z-10"
         >
           <ChevronLeft className="w-3.5 h-3.5" />
         </button>
         <button
           onClick={handleNext}
           title="下一页"
-          className="absolute -right-1 top-1/2 -translate-y-1/2 p-1 rounded-full glass-button-pure text-white/50 hover:text-white opacity-0 group-hover:opacity-100 transition-all z-10"
+          className="absolute -right-1 top-1/2 h-6 w-6 -translate-y-1/2 flex items-center justify-center p-0 rounded-full text-white/50 hover:bg-white/10 hover:text-white hover:drop-shadow-[0_0_6px_rgba(255,255,255,0.7)] opacity-0 group-hover:opacity-100 transition-opacity z-10"
         >
           <ChevronRight className="w-3.5 h-3.5" />
         </button>
