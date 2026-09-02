@@ -2,7 +2,7 @@
 
 > **专为 Vibe Coding 打造的开源多源 AI 用量与额度监控桌面磁贴** —— 无边框、置顶、可鼠标穿透的纯净毛玻璃悬浮小部件，支持 OpenCode Go、DeepSeek 官方、Google Gemini Pro、GPT（ChatGPT Plus / Pro）及本地全量 Token 统计。
 
-![Version](https://img.shields.io/badge/version-1.3.3-blue)
+![Version](https://img.shields.io/badge/version-1.3.4-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue)
 ![Tech](https://img.shields.io/badge/tech-Electron%20%2F%20React%2019%20%2F%20TailwindCSS%20%2F%20SQLite-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -38,7 +38,7 @@
 
 ### 安装
 
-前往 [GitHub Releases](https://github.com/Hanfei1224/TokenMonitor/releases) 下载最新安装包 `TokenMonitor Setup 1.3.3.exe`，一键安装即可。本版本只发布 Windows NSIS 安装版，不提供绿色便携版。
+前往 [GitHub Releases](https://github.com/Hanfei1224/TokenMonitor/releases) 下载最新安装包 `TokenMonitor Setup 1.3.4.exe`，一键安装即可。本版本只发布 Windows NSIS 安装版，不提供绿色便携版。
 
 > 安装版及 Electron 持久化数据都位于安装目录：配置文件为 `config.json`；升级安装会自动保留其中的 API 凭证。开发版使用工作区内的 `.dev-data/config.json`，与安装版相互隔离。GPT refresh token 也保存在该文件中，但仍使用 Windows 安全存储加密。
 

@@ -52,7 +52,19 @@ function getOrSetStartBalance(currentBalance: number): number {
   return currentBalance
 }
 
-export async function fetchDeepSeekBalance(apiKey: string): Promise<DeepSeekBalanceData> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error('请求已取消')
+}
+
+async function readJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  const data = await response.json() as T
+  throwIfAborted(signal)
+  return data
+}
+
+export async function fetchDeepSeekBalance(apiKey: string, signal?: AbortSignal): Promise<DeepSeekBalanceData> {
+  throwIfAborted(signal)
   if (!apiKey) {
     return { configured: false }
   }
@@ -63,9 +75,11 @@ export async function fetchDeepSeekBalance(apiKey: string): Promise<DeepSeekBala
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Accept': 'application/json'
-      }
+      },
+      signal
     })
 
+    throwIfAborted(signal)
     if (!res.ok) {
       if (res.status === 401 || res.status === 403) {
         return { configured: true, error: 'API Key 无效或过期' }
@@ -73,7 +87,8 @@ export async function fetchDeepSeekBalance(apiKey: string): Promise<DeepSeekBala
       return { configured: true, error: `HTTP ${res.status}` }
     }
 
-    const json = await res.json()
+    const json = await readJson<any>(res, signal)
+    throwIfAborted(signal)
     const info = json.balance_infos?.[0]
     if (!info) {
       return { configured: true, is_available: json.is_available, error: '未获取到余额信息' }
@@ -96,10 +111,11 @@ export async function fetchDeepSeekBalance(apiKey: string): Promise<DeepSeekBala
       usedPercent,
       error: null
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
+    throwIfAborted(signal)
     return {
       configured: true,
-      error: err.message || '网络连接异常'
+      error: err instanceof Error && err.message ? err.message : '网络连接异常'
     }
   }
 }

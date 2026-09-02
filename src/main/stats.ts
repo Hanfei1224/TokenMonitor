@@ -2,8 +2,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import readline from 'node:readline'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { app } from 'electron'
-import initSqlJs from 'sql.js'
 import { getStorageDir } from './paths.js'
 
 export interface TokenStatsRow {
@@ -93,6 +93,17 @@ const statsCache: StatsCache = {
   isScanning: false
 }
 
+let statsBackgroundScannerStarted = false
+let statsInterval: ReturnType<typeof setInterval> | null = null
+
+interface JsonlFileState {
+  size: number
+  mtimeMs: number
+}
+
+const jsonlFileStates = new Map<string, JsonlFileState>()
+const activeSqliteWorkers = new Set<ReturnType<typeof spawn>>()
+
 function bump(map: Record<string, number>, key: string | undefined, n: number) {
   if (!key || !n) return
   map[key] = (map[key] || 0) + n
@@ -102,62 +113,239 @@ function rowModel(r: TokenStatsRow): string {
   return r.model || r.provider || r.source || 'unknown'
 }
 
-let sqlJsInstance: any = null
+type AggregateDays = Record<string, DayStats>
 
-function getWasmPath(): string {
-  const appPath = app.getAppPath()
-  const possiblePaths = [
-    // Packaged app: prefer the unpacked file because WebAssembly loaders do
-    // not consistently handle virtual paths inside app.asar.
-    path.join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', 'main', 'sql-wasm.wasm'),
-    path.join(process.resourcesPath, 'dist-electron', 'main', 'sql-wasm.wasm'),
-    path.join(appPath, 'dist-electron', 'main', 'sql-wasm.wasm'),
-    // Development and unpacked directory builds.
-    path.join(appPath, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm'),
-    path.resolve(process.cwd(), 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm'),
-    path.resolve(process.cwd(), 'src', 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm')
-  ]
-  for (const wasmPath of possiblePaths) {
-    if (fs.existsSync(wasmPath)) return wasmPath
-  }
-  throw new Error(`sql-wasm.wasm not found; searched: ${possiblePaths.join('; ')}`)
+interface AggregateScan {
+  days: AggregateDays
+  maxTs: number
+  successful: boolean
 }
 
-async function getSqlJs() {
-  if (!sqlJsInstance) {
-    const wasmPath = getWasmPath()
-    if (wasmPath) {
-      sqlJsInstance = await initSqlJs({
-        locateFile: () => wasmPath
-      })
-    } else {
-      sqlJsInstance = await initSqlJs()
+interface SqliteWorkerRequest {
+  kind: 'opencode' | 'zcode'
+  dbPath?: string
+  dbPaths?: string[]
+  startMs: number
+}
+
+const SQLITE_WORKER_TIMEOUT_MS = 60 * 1000
+
+function createDayStats(date: string): DayStats {
+  return {
+    date,
+    total: 0,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    hit_rate: 0,
+    requests: 0,
+    byModel: {},
+    byModelCalls: {}
+  }
+}
+
+function dayKeyForTimestamp(ts: number): string {
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function updateHitRate(day: DayStats): void {
+  const cacheTotal = day.cache_read + day.cache_write
+  if (day.input + cacheTotal > 0) {
+    day.hit_rate = Math.round((cacheTotal / (day.input + cacheTotal)) * 100)
+  }
+}
+
+function addTokenRow(days: AggregateDays, row: TokenStatsRow): void {
+  const date = dayKeyForTimestamp(row.ts)
+  const day = days[date] || (days[date] = createDayStats(date))
+
+  day.total += row.total
+  day.input += row.input
+  day.output += row.output
+  day.cache_read += row.cache_read
+  day.cache_write += row.cache_write
+  day.requests += 1
+
+  const model = rowModel(row)
+  bump(day.byModel, model, row.total)
+  bump(day.byModelCalls, model, 1)
+  updateHitRate(day)
+}
+
+function mergeAggregateDays(target: AggregateDays, source: AggregateDays): void {
+  for (const [date, sourceDay] of Object.entries(source)) {
+    const targetDay = target[date] || (target[date] = createDayStats(date))
+    targetDay.total += sourceDay.total
+    targetDay.input += sourceDay.input
+    targetDay.output += sourceDay.output
+    targetDay.cache_read += sourceDay.cache_read
+    targetDay.cache_write += sourceDay.cache_write
+    targetDay.requests += sourceDay.requests
+
+    for (const [model, total] of Object.entries(sourceDay.byModel || {})) {
+      bump(targetDay.byModel, model, total)
     }
+    for (const [model, calls] of Object.entries(sourceDay.byModelCalls || {})) {
+      bump(targetDay.byModelCalls, model, calls)
+    }
+    updateHitRate(targetDay)
   }
-  return sqlJsInstance
 }
 
-async function sqliteQueryAll(dbPath: string, sql: string, params: unknown[] = []): Promise<Record<string, unknown>[]> {
-  if (!fs.existsSync(dbPath)) return []
+function firstExistingFile(candidates: string[]): string | null {
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+function sqliteWorkerPath(): string | null {
+  const candidates = app.isPackaged
+    ? [path.join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', 'main', 'sqlite-worker.cjs')]
+    : [
+        path.join(app.getAppPath(), 'dist-electron', 'main', 'sqlite-worker.cjs'),
+        path.join(app.getAppPath(), 'main', 'sqlite-worker.cjs'),
+        path.resolve(process.cwd(), 'dist-electron', 'main', 'sqlite-worker.cjs'),
+        path.resolve(process.cwd(), 'src', 'dist-electron', 'main', 'sqlite-worker.cjs')
+      ]
+  return firstExistingFile(candidates)
+}
+
+function sqliteNodePath(): string | null {
+  const nodeName = process.platform === 'win32' ? 'node.exe' : 'node'
+  if (app.isPackaged) {
+    // The worker must use the Node runtime shipped with the installer, never Electron.
+    return firstExistingFile([path.join(process.resourcesPath, 'node-runtime', nodeName)])
+  }
+
+  const configured = process.env.TOKENMONITOR_NODE_PATH?.trim()
+  if (configured) {
+    if (!path.isAbsolute(configured) || !fs.existsSync(configured)) {
+      throw new Error(`TOKENMONITOR_NODE_PATH must point to an existing absolute Node executable: ${configured}`)
+    }
+    return configured
+  }
+  return 'node'
+}
+
+async function runSqliteWorker(request: SqliteWorkerRequest): Promise<unknown> {
+  const nodePath = sqliteNodePath()
+  const workerPath = sqliteWorkerPath()
+  if (!nodePath) {
+    const nodeName = process.platform === 'win32' ? 'node.exe' : 'node'
+    throw new Error(`SQLite statistics unavailable: packaged Node runtime was not found at ${path.join(process.resourcesPath, 'node-runtime', nodeName)}`)
+  }
+  if (!workerPath) {
+    throw new Error(`SQLite statistics disabled: worker script was not found${app.isPackaged ? ' in the packaged resources' : ''}`)
+  }
+
+  const child = spawn(nodePath, [workerPath], {
+    cwd: path.dirname(workerPath),
+    env: process.env,
+    windowsHide: true,
+    shell: false,
+    stdio: ['pipe', 'pipe', 'pipe']
+  })
+  activeSqliteWorkers.add(child)
+
+  let stdout = ''
+  let stderr = ''
+  let timer: ReturnType<typeof setTimeout> | undefined
+
   try {
-    const SQL = await getSqlJs()
-    const fileBuffer = fs.readFileSync(dbPath)
-    const db = new SQL.Database(fileBuffer)
-    const stmt = db.prepare(sql)
-    if (params && params.length > 0) {
-      stmt.bind(params)
-    }
-    const rows: Record<string, unknown>[] = []
-    while (stmt.step()) {
-      rows.push(stmt.getAsObject())
-    }
-    stmt.free()
-    db.close()
-    return rows
-  } catch (err) {
-    console.error('sqliteQueryAll (sql.js) failed on', dbPath, err)
-    throw err
+    return await new Promise<unknown>((resolve, reject) => {
+      let settled = false
+      const finish = (error?: Error, value?: unknown) => {
+        if (settled) return
+        settled = true
+        if (error) reject(error)
+        else resolve(value)
+      }
+
+      child.stdout?.setEncoding('utf8')
+      child.stderr?.setEncoding('utf8')
+      child.stdout?.on('data', (chunk: string) => {
+        stdout += chunk
+      })
+      child.stderr?.on('data', (chunk: string) => {
+        stderr += chunk
+      })
+      child.once('error', (error) => finish(error instanceof Error ? error : new Error(String(error))))
+      child.once('close', (code, signal) => {
+        if (code !== 0) {
+          const detail = stderr.trim() || `exit code ${code ?? 'null'}${signal ? `, signal ${signal}` : ''}`
+          finish(new Error(`SQLite worker failed: ${detail}`))
+          return
+        }
+        try {
+          finish(undefined, JSON.parse(stdout))
+        } catch (error) {
+          finish(new Error(`SQLite worker returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`))
+        }
+      })
+
+      timer = setTimeout(() => {
+        child.kill()
+        finish(new Error(`SQLite worker timed out after ${SQLITE_WORKER_TIMEOUT_MS}ms`))
+      }, SQLITE_WORKER_TIMEOUT_MS)
+
+      try {
+        child.stdin?.end(JSON.stringify(request))
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (child.exitCode === null && !child.killed) child.kill()
+    activeSqliteWorkers.delete(child)
   }
+}
+
+function numericAggregateValue(value: unknown, field: string): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) throw new Error(`SQLite worker returned invalid ${field}`)
+  return n
+}
+
+function parseSqliteAggregate(value: unknown, startMs: number): AggregateScan {
+  if (!value || typeof value !== 'object') throw new Error('SQLite worker returned a non-object result')
+  const result = value as { maxTs?: unknown; aggregates?: unknown }
+  if (!Array.isArray(result.aggregates)) throw new Error('SQLite worker returned no aggregate list')
+
+  const days: AggregateDays = {}
+  let maxTs = Math.max(startMs, numericAggregateValue(result.maxTs ?? startMs, 'maxTs'))
+  for (const item of result.aggregates) {
+    if (!item || typeof item !== 'object') throw new Error('SQLite worker returned an invalid aggregate')
+    const row = item as Record<string, unknown>
+    const date = typeof row.date === 'string' ? row.date : ''
+    const model = typeof row.model === 'string' ? row.model : ''
+    if (!date || !model) throw new Error('SQLite worker returned an aggregate without date or model')
+
+    const day = days[date] || (days[date] = createDayStats(date))
+    const total = numericAggregateValue(row.total, 'total')
+    const input = numericAggregateValue(row.input, 'input')
+    const output = numericAggregateValue(row.output, 'output')
+    const cacheRead = numericAggregateValue(row.cache_read, 'cache_read')
+    const cacheWrite = numericAggregateValue(row.cache_write, 'cache_write')
+    const requests = numericAggregateValue(row.requests, 'requests')
+    day.total += total
+    day.input += input
+    day.output += output
+    day.cache_read += cacheRead
+    day.cache_write += cacheWrite
+    day.requests += requests
+    bump(day.byModel, model, total)
+    bump(day.byModelCalls, model, requests)
+    updateHitRate(day)
+
+    const rowMaxTs = Number(row.max_ts)
+    if (Number.isFinite(rowMaxTs)) maxTs = Math.max(maxTs, rowMaxTs)
+  }
+
+  return { days, maxTs, successful: true }
 }
 
 function getCacheFilePath(): string {
@@ -297,9 +485,9 @@ async function walkJsonl(
   root: string,
   filterMtimeMs: number,
   parseLine: (line: string) => TokenStatsRow | null
-): Promise<TokenStatsRow[]> {
-  const rows: TokenStatsRow[] = []
-  if (!fs.existsSync(root)) return rows
+): Promise<AggregateDays> {
+  const days: AggregateDays = {}
+  if (!fs.existsSync(root)) return days
 
   async function walkDir(dir: string) {
     let entries: fs.Dirent[]
@@ -315,23 +503,36 @@ async function walkJsonl(
         continue
       }
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+      let stream: fs.ReadStream | null = null
+      let rl: readline.Interface | null = null
       try {
         const stat = await fs.promises.stat(fullPath)
-        if (filterMtimeMs > 0 && stat.mtimeMs < filterMtimeMs) continue
-        const stream = fs.createReadStream(fullPath, { encoding: 'utf-8' })
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
+        const previous = jsonlFileStates.get(fullPath)
+        const currentState = { size: stat.size, mtimeMs: stat.mtimeMs }
+        if (filterMtimeMs > 0 && stat.mtimeMs < filterMtimeMs) {
+          jsonlFileStates.set(fullPath, currentState)
+          continue
+        }
+        if (filterMtimeMs > 0 && previous?.size === stat.size && previous.mtimeMs === stat.mtimeMs) continue
+        stream = fs.createReadStream(fullPath, { encoding: 'utf-8' })
+        rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
         for await (const line of rl) {
           const row = parseLine(line)
-          if (row && (filterMtimeMs === 0 || row.ts > filterMtimeMs)) rows.push(row)
+          if (row && (filterMtimeMs === 0 || row.ts > filterMtimeMs)) addTokenRow(days, row)
         }
+        const finalStat = await fs.promises.stat(fullPath)
+        jsonlFileStates.set(fullPath, { size: finalStat.size, mtimeMs: finalStat.mtimeMs })
       } catch {
         // skip unreadable file
+      } finally {
+        rl?.close()
+        stream?.destroy()
       }
     }
   }
 
   await walkDir(root)
-  return rows
+  return days
 }
 
 function opencodeDbPaths(): string[] {
@@ -342,125 +543,39 @@ function opencodeDbPaths(): string[] {
   ]
 }
 
-type OpenCodeMsg = {
-  session_id: string
-  ts: number
-  total: number
-  input: number
-  output: number
-  reasoning: number
-  cache_read: number
-  cache_write: number
-  hasError: number
-  completed: number | null
-  provider: string | null
-  model: string | null
-  agent: string | null
-}
+async function scanOpencodeAggregate(startMs: number): Promise<AggregateScan> {
+  const dbPaths = opencodeDbPaths()
+  if (!dbPaths.some((dbPath) => fs.existsSync(dbPath))) {
+    return { days: {}, maxTs: startMs, successful: true }
+  }
 
-function toOpencodeRow(m: OpenCodeMsg): TokenStatsRow {
-  const output = Number(m.output || 0) + Number(m.reasoning || 0)
-  const total = Math.max(Number(m.total || 0), m.input + output + m.cache_read + m.cache_write)
-  return {
-    ts: m.ts,
-    total,
-    input: Number(m.input || 0),
-    output,
-    cache_read: Number(m.cache_read || 0),
-    cache_write: Number(m.cache_write || 0),
-    source: 'opencode',
-    provider: m.provider || undefined,
-    agent: m.agent || undefined,
-    model: m.model || undefined
+  try {
+    const result = await runSqliteWorker({ kind: 'opencode', dbPaths, startMs })
+    return parseSqliteAggregate(result, startMs)
+  } catch (err) {
+    console.error('OpenCode SQLite worker scan skipped:', err)
+    // Keep the watermark unchanged so a later scan retries the missing data.
+    return { days: {}, maxTs: startMs, successful: false }
   }
 }
 
-async function scanOpencodeRows(startMs: number): Promise<{ rows: TokenStatsRow[]; maxTs: number }> {
-  let queried: Record<string, unknown>[] = []
-  for (const dbPath of opencodeDbPaths()) {
-    queried = await sqliteQueryAll(
-      dbPath,
-      `SELECT session_id,
-              time_created AS ts,
-              COALESCE(json_extract(data,'$.tokens.total'),0) AS total,
-              COALESCE(json_extract(data,'$.tokens.input'),0) AS input,
-              COALESCE(json_extract(data,'$.tokens.output'),0) AS output,
-              COALESCE(json_extract(data,'$.tokens.reasoning'),0) AS reasoning,
-              COALESCE(json_extract(data,'$.tokens.cache.read'),0) AS cache_read,
-              COALESCE(json_extract(data,'$.tokens.cache.write'),0) AS cache_write,
-              json_extract(data,'$.time.completed') AS completed,
-              CASE WHEN json_extract(data,'$.error') IS NULL THEN 0 ELSE 1 END AS has_error,
-              json_extract(data,'$.providerID') AS provider,
-              json_extract(data,'$.modelID') AS model,
-              COALESCE(json_extract(data,'$.agent'), json_extract(data,'$.mode')) AS agent
-       FROM message
-       WHERE json_extract(data,'$.role')='assistant' AND time_created > ?
-       ORDER BY time_created ASC`,
-      [startMs]
-    )
-    if (queried.length || fs.existsSync(dbPath)) break
-  }
-
-  let maxTs = startMs
-  const rows: TokenStatsRow[] = []
-  for (const r of queried) {
-    const ts = Number(r.ts || 0)
-    if (ts > maxTs) maxTs = ts
-    const output = Number(r.output || 0) + Number(r.reasoning || 0)
-    const total = Math.max(Number(r.total || 0), Number(r.input || 0) + output + Number(r.cache_read || 0) + Number(r.cache_write || 0))
-    rows.push({
-      ts,
-      total,
-      input: Number(r.input || 0),
-      output,
-      cache_read: Number(r.cache_read || 0),
-      cache_write: Number(r.cache_write || 0),
-      source: 'opencode',
-      provider: r.provider ? String(r.provider) : undefined,
-      model: r.model ? String(r.model) : undefined,
-      agent: r.agent ? String(r.agent) : undefined
-    })
-  }
-
-  return { rows, maxTs }
-}
-
-async function scanZcodeRows(startMs: number): Promise<{ rows: TokenStatsRow[]; maxTs: number }> {
+async function scanZcodeAggregate(startMs: number): Promise<AggregateScan> {
   const dbPath = path.join(os.homedir(), '.zcode', 'cli', 'db', 'db.sqlite')
-  const queried = await sqliteQueryAll(
-    dbPath,
-    `SELECT started_at, input_tokens, output_tokens, cache_creation_input_tokens,
-            cache_read_input_tokens, computed_total_tokens, agent, provider_id, model_id
-     FROM model_usage
-     WHERE status='completed' AND computed_total_tokens > 0 AND started_at > ?
-     ORDER BY started_at ASC`,
-    [startMs]
-  )
-  let maxTs = startMs
-  const rows: TokenStatsRow[] = []
-  for (const r of queried) {
-    const ts = Number(r.started_at || 0)
-    if (ts > maxTs) maxTs = ts
-    const cr = Number(r.cache_read_input_tokens || 0)
-    const cw = Number(r.cache_creation_input_tokens || 0)
-    const inp = Number(r.input_tokens || 0)
-    rows.push({
-      ts,
-      total: Number(r.computed_total_tokens || 0),
-      input: Math.max(0, inp - cr - cw),
-      output: Number(r.output_tokens || 0),
-      cache_read: cr,
-      cache_write: cw,
-      source: 'zcode',
-      provider: r.provider_id ? String(r.provider_id) : 'zcode',
-      agent: r.agent ? String(r.agent) : undefined,
-      model: r.model_id ? String(r.model_id) : undefined
-    })
+  if (!fs.existsSync(dbPath)) {
+    return { days: {}, maxTs: startMs, successful: true }
   }
-  return { rows, maxTs }
+
+  try {
+    const result = await runSqliteWorker({ kind: 'zcode', dbPath, startMs })
+    return parseSqliteAggregate(result, startMs)
+  } catch (err) {
+    console.error('ZCode SQLite worker scan skipped:', err)
+    // Keep the watermark unchanged so a later scan retries the missing data.
+    return { days: {}, maxTs: startMs, successful: false }
+  }
 }
 
-function scanClaudeRowsAsync(filterMtimeMs: number): Promise<TokenStatsRow[]> {
+function scanClaudeAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
   return walkJsonl(path.join(os.homedir(), '.claude', 'projects'), filterMtimeMs, (line) => {
     const trimmed = line.trim()
     if (!trimmed || trimmed[0] !== '{') return null
@@ -494,7 +609,7 @@ function scanClaudeRowsAsync(filterMtimeMs: number): Promise<TokenStatsRow[]> {
   })
 }
 
-function scanPiRowsAsync(filterMtimeMs: number): Promise<TokenStatsRow[]> {
+function scanPiAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
   return walkJsonl(path.join(os.homedir(), '.pi', 'agent', 'sessions'), filterMtimeMs, (line) => {
     if (!line.includes('totalTokens')) return null
     try {
@@ -522,7 +637,7 @@ function scanPiRowsAsync(filterMtimeMs: number): Promise<TokenStatsRow[]> {
   })
 }
 
-function scanCodexRowsAsync(filterMtimeMs: number): Promise<TokenStatsRow[]> {
+function scanCodexAggregateAsync(filterMtimeMs: number): Promise<AggregateDays> {
   return walkJsonl(path.join(os.homedir(), '.codex', 'sessions'), filterMtimeMs, (line) => {
     if (!line.includes('"token_count"')) return null
     try {
@@ -576,71 +691,31 @@ export async function aggregateFullStats(): Promise<void> {
 
     const scanStartTime = Date.now()
 
-    // 并发增量采集
-    const [opencodeRes, zcodeRes, claudeRows, piRows, codexRows] = await Promise.all([
-      scanOpencodeRows(opencodeStartTs),
-      scanZcodeRows(zcodeStartTs),
-      scanClaudeRowsAsync(claudeMtime),
-      scanPiRowsAsync(piMtime),
-      scanCodexRowsAsync(codexMtime)
+    // 并发增量采集；每个数据源只保留按天/模型聚合桶。
+    const [opencodeRes, zcodeRes, claudeDays, piDays, codexDays] = await Promise.all([
+      scanOpencodeAggregate(opencodeStartTs),
+      scanZcodeAggregate(zcodeStartTs),
+      scanClaudeAggregateAsync(claudeMtime),
+      scanPiAggregateAsync(piMtime),
+      scanCodexAggregateAsync(codexMtime)
     ])
-
-    const incrementalRows = [
-      ...opencodeRes.rows,
-      ...zcodeRes.rows,
-      ...claudeRows,
-      ...piRows,
-      ...codexRows
-    ]
 
     // 将增量数据合并入缓存字典
     const daysMap = { ...diskCache.days }
-
-    // 如果是首日或者今天有新数据，更新 today
-    for (const r of incrementalRows) {
-      const d = new Date(r.ts)
-      const y = d.getFullYear()
-      const m = d.getMonth() + 1
-      const day = d.getDate()
-      const dKey = `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`
-
-      if (!daysMap[dKey]) {
-        daysMap[dKey] = {
-          date: dKey,
-          total: 0,
-          input: 0,
-          output: 0,
-          cache_read: 0,
-          cache_write: 0,
-          hit_rate: 0,
-          requests: 0,
-          byModel: {},
-          byModelCalls: {}
-        }
-      }
-
-      const dayObj = daysMap[dKey]
-      dayObj.total += r.total
-      dayObj.input += r.input
-      dayObj.output += r.output
-      dayObj.cache_read += r.cache_read
-      dayObj.cache_write += r.cache_write
-      dayObj.requests += 1
-
-      const modelName = rowModel(r)
-      bump(dayObj.byModel, modelName, r.total)
-      bump(dayObj.byModelCalls, modelName, 1)
-
-      const cacheTotal = dayObj.cache_read + dayObj.cache_write
-      if (dayObj.input + cacheTotal > 0) {
-        dayObj.hit_rate = Math.round((cacheTotal / (dayObj.input + cacheTotal)) * 100)
-      }
-    }
+    mergeAggregateDays(daysMap, opencodeRes.days)
+    mergeAggregateDays(daysMap, zcodeRes.days)
+    mergeAggregateDays(daysMap, claudeDays)
+    mergeAggregateDays(daysMap, piDays)
+    mergeAggregateDays(daysMap, codexDays)
 
     // 更新水库刻度线
     const updatedWatermarks = {
-      opencode_max_ts: Math.max(diskCache.watermarks.opencode_max_ts || 0, opencodeRes.maxTs),
-      zcode_max_ts: Math.max(diskCache.watermarks.zcode_max_ts || 0, zcodeRes.maxTs),
+      opencode_max_ts: opencodeRes.successful
+        ? Math.max(diskCache.watermarks.opencode_max_ts || 0, opencodeRes.maxTs)
+        : diskCache.watermarks.opencode_max_ts || 0,
+      zcode_max_ts: zcodeRes.successful
+        ? Math.max(diskCache.watermarks.zcode_max_ts || 0, zcodeRes.maxTs)
+        : diskCache.watermarks.zcode_max_ts || 0,
       claude_scan_time: scanStartTime,
       pi_scan_time: scanStartTime,
       codex_scan_time: scanStartTime
@@ -666,8 +741,23 @@ export async function aggregateFullStats(): Promise<void> {
 }
 
 export function startStatsBackgroundScanner(): void {
-  aggregateFullStats()
-  setInterval(aggregateFullStats, 60 * 1000)
+  if (statsBackgroundScannerStarted) return
+  statsBackgroundScannerStarted = true
+  void aggregateFullStats()
+  statsInterval = setInterval(() => {
+    void aggregateFullStats()
+  }, 60 * 1000)
+}
+
+export function stopStatsBackgroundScanner(): void {
+  if (statsInterval) {
+    clearInterval(statsInterval)
+    statsInterval = null
+  }
+  for (const worker of activeSqliteWorkers) {
+    if (worker.exitCode === null && !worker.killed) worker.kill()
+  }
+  activeSqliteWorkers.clear()
 }
 
 export function getCachedTodayStats(): TodayStats {

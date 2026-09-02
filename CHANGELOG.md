@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.4] - 2026-09-02
+
+### Changed
+- 将本地 SQLite 统计查询移至独立 Node worker，并改为按日期与模型聚合，避免大体积 OpenCode 数据库占用 Electron 主进程内存。
+- JSONL 统计改为有界流式聚合，跳过未变化文件，并在退出时清理统计 worker 与定时器。
+- 打包时内置独立 Node runtime，确保安装版仍可正常读取本地 SQLite 统计数据。
+- 轮询请求改为单飞调度，超时会真实取消底层网络请求。
+
+### Fixed
+- 修复 OpenCode 数据库较大时主进程内存持续升高、占用达到 GB 级的问题。
+- 修复多次手动刷新、保存配置或 OAuth 操作可能产生重叠请求的问题。
+- 修复 Google OAuth 登录长期未完成时本地回调服务不释放的问题。
+- 修复 ZCode 缺少模型名时统计归类不一致的问题。
+
 ## [1.3.3] - 2026-09-01
 
 ### Fixed

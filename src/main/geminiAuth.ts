@@ -22,6 +22,19 @@ const QUOTA_ENDPOINTS = [
 ]
 
 let authServer: http.Server | null = null
+let cancelActiveGoogleLogin: (() => void) | null = null
+const GOOGLE_LOGIN_TIMEOUT_MS = 5 * 60 * 1000
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error('请求已取消')
+}
+
+async function readJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  const data = await response.json() as T
+  throwIfAborted(signal)
+  return data
+}
 
 export interface PoolQuota {
   percent: number
@@ -41,8 +54,13 @@ export interface GeminiQuotaData {
  * 启动本地临时 OAuth HTTP 服务器并打开浏览器
  */
 export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; error?: string }> {
+  cancelActiveGoogleLogin?.()
+
   return new Promise((resolve) => {
     const state = randomUUID()
+    const requestController = new AbortController()
+    let settled = false
+    let loginTimer: ReturnType<typeof setTimeout> | null = null
 
     if (authServer) {
       try {
@@ -51,8 +69,24 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
       authServer = null
     }
 
+    const finish = (result: { success: boolean; email?: string; error?: string }) => {
+      if (settled) return
+      settled = true
+      if (loginTimer) clearTimeout(loginTimer)
+      if (cancelActiveGoogleLogin === cancel) cancelActiveGoogleLogin = null
+      resolve(result)
+      cleanup()
+    }
+    const cancel = () => finish({ success: false, error: 'Google 登录已取消' })
+    cancelActiveGoogleLogin = cancel
+
     const server = http.createServer(async (req, res) => {
       try {
+        if (settled) {
+          res.writeHead(410)
+          res.end()
+          return
+        }
         const urlObj = new URL(req.url || '', `http://localhost`)
         if (urlObj.pathname === '/oauth/callback') {
           const code = urlObj.searchParams.get('code')
@@ -62,8 +96,7 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
           if (receivedState !== state) {
             res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' })
             res.end('<h3>授权请求已失效，请返回应用重新登录。</h3>')
-            resolve({ success: false, error: 'OAuth state mismatch' })
-            cleanup()
+            finish({ success: false, error: 'OAuth state mismatch' })
             return
           }
 
@@ -77,8 +110,7 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
                 </body>
               </html>
             `)
-            resolve({ success: false, error })
-            cleanup()
+            finish({ success: false, error })
             return
           }
 
@@ -100,21 +132,25 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
                 client_secret: GOOGLE_CLIENT_SECRET,
                 redirect_uri: redirectUri,
                 grant_type: 'authorization_code'
-              }).toString()
+              }).toString(),
+              signal: requestController.signal
             })
 
-            const tokenData = await tokenRes.json()
+            const tokenData = await readJson<any>(tokenRes, requestController.signal)
 
             if (tokenData.refresh_token) {
               // 获取用户邮箱
               let userEmail = 'Google 用户'
               try {
                 const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-                  headers: { Authorization: `Bearer ${tokenData.access_token}` }
+                  headers: { Authorization: `Bearer ${tokenData.access_token}` },
+                  signal: requestController.signal
                 })
-                const userData = await userRes.json()
+                const userData = await readJson<any>(userRes, requestController.signal)
                 if (userData.email) userEmail = userData.email
-              } catch {}
+              } catch {
+                throwIfAborted(requestController.signal)
+              }
 
               saveConfig({
                 geminiRefreshToken: tokenData.refresh_token,
@@ -134,8 +170,7 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
                 </html>
               `)
 
-              resolve({ success: true, email: userEmail })
-              cleanup()
+              finish({ success: true, email: userEmail })
               return
             } else {
               throw new Error(tokenData.error_description || tokenData.error || '未能获取 refresh_token')
@@ -148,17 +183,22 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
       } catch (err: any) {
         res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' })
         res.end(`<h3>授权处理出错：${err.message}</h3>`)
-        resolve({ success: false, error: err.message })
-        cleanup()
+        finish({ success: false, error: err.message })
       }
     })
 
+    let cleanupTimer: ReturnType<typeof setTimeout> | null = null
+    let cleaned = false
     function cleanup() {
-      setTimeout(() => {
+      if (cleaned) return
+      cleaned = true
+      requestController.abort()
+      cleanupTimer = setTimeout(() => {
+        cleanupTimer = null
         try {
           server.close()
         } catch {}
-        authServer = null
+        if (authServer === server) authServer = null
       }, 2000)
     }
 
@@ -179,11 +219,19 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
       }).toString()
 
       authServer = server
-      shell.openExternal(authUrl)
+      loginTimer = setTimeout(() => {
+        finish({ success: false, error: 'Google OAuth 登录超时，请重试' })
+      }, GOOGLE_LOGIN_TIMEOUT_MS)
+      void shell.openExternal(authUrl).catch((err: unknown) => {
+        finish({
+          success: false,
+          error: err instanceof Error && err.message ? err.message : '无法打开 Google 登录页面'
+        })
+      })
     })
 
     server.on('error', (err) => {
-      resolve({ success: false, error: err.message })
+      finish({ success: false, error: err.message })
     })
   })
 }
@@ -191,7 +239,12 @@ export function startGoogleOAuth(): Promise<{ success: boolean; email?: string; 
 /**
  * 获取 Google 官方真实 Gemini 与 Claude 剩余配额及重置时间
  */
-export async function fetchGeminiQuota(refreshToken: string, email?: string): Promise<GeminiQuotaData> {
+export async function fetchGeminiQuota(
+  refreshToken: string,
+  email?: string,
+  signal?: AbortSignal
+): Promise<GeminiQuotaData> {
+  throwIfAborted(signal)
   if (!refreshToken) {
     return { configured: false }
   }
@@ -209,11 +262,16 @@ export async function fetchGeminiQuota(refreshToken: string, email?: string): Pr
         client_secret: GOOGLE_CLIENT_SECRET,
         refresh_token: refreshToken,
         grant_type: 'refresh_token'
-      }).toString()
+      }).toString(),
+      signal
     })
 
+    throwIfAborted(signal)
     if (!tokenRes.ok) {
-      const errJson = await tokenRes.json().catch(() => ({}))
+      const errJson = await readJson<any>(tokenRes, signal).catch(() => {
+        throwIfAborted(signal)
+        return {}
+      })
       if (tokenRes.status === 400 || tokenRes.status === 401) {
         return {
           configured: true,
@@ -225,7 +283,7 @@ export async function fetchGeminiQuota(refreshToken: string, email?: string): Pr
       throw new Error(errJson.error_description || `HTTP ${tokenRes.status}`)
     }
 
-    const tokenData = await tokenRes.json()
+    const tokenData = await readJson<any>(tokenRes, signal)
     const accessToken = tokenData.access_token
 
     // 获取邮箱
@@ -233,11 +291,14 @@ export async function fetchGeminiQuota(refreshToken: string, email?: string): Pr
     if (!currentEmail) {
       try {
         const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-          headers: { Authorization: `Bearer ${accessToken}` }
+          headers: { Authorization: `Bearer ${accessToken}` },
+          signal
         })
-        const userData = await userRes.json()
+        const userData = await readJson<any>(userRes, signal)
         if (userData.email) currentEmail = userData.email
-      } catch {}
+      } catch {
+        throwIfAborted(signal)
+      }
     }
 
     // 2. 调用 Antigravity-Manager 同款 Google 配额接口
@@ -251,13 +312,17 @@ export async function fetchGeminiQuota(refreshToken: string, email?: string): Pr
             'Content-Type': 'application/json',
             'User-Agent': 'vscode/1.X.X (Antigravity/4.3.0)'
           },
-          body: JSON.stringify({})
+          body: JSON.stringify({}),
+          signal
         })
+        throwIfAborted(signal)
         if (qRes.ok) {
-          modelsData = await qRes.json()
+          modelsData = await readJson<any>(qRes, signal)
           if (modelsData && modelsData.models) break
         }
-      } catch {}
+      } catch {
+        throwIfAborted(signal)
+      }
     }
 
     let geminiPool: PoolQuota = { percent: 100, resetsAt: null }
@@ -320,11 +385,12 @@ export async function fetchGeminiQuota(refreshToken: string, email?: string): Pr
       status: 'active',
       error: null
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
+    throwIfAborted(signal)
     return {
       configured: true,
       email,
-      error: err.message || '网络连接异常'
+      error: err instanceof Error && err.message ? err.message : '网络连接异常'
     }
   }
 }

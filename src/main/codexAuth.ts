@@ -161,8 +161,41 @@ function sessionIsUsable(value: CodexSession): boolean {
   return value.expiresAt > Date.now() + 60_000
 }
 
-function timeoutSignal(): AbortSignal {
-  return AbortSignal.timeout(TOKEN_TIMEOUT_MS)
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error('请求已取消')
+}
+
+async function readJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  const data = await response.json() as T
+  throwIfAborted(signal)
+  return data
+}
+
+function createRequestSignal(parent?: AbortSignal): {
+  signal: AbortSignal
+  cleanup: () => void
+} {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('ChatGPT 请求超时')), TOKEN_TIMEOUT_MS)
+  const abortFromParent = () => controller.abort(parent?.reason ?? new Error('请求已取消'))
+
+  if (parent) {
+    if (parent.aborted) {
+      abortFromParent()
+    } else {
+      parent.addEventListener('abort', abortFromParent, { once: true })
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer)
+      parent?.removeEventListener('abort', abortFromParent)
+      controller.abort()
+    }
+  }
 }
 
 function safeErrorMessage(err: unknown, fallback: string): string {
@@ -171,92 +204,104 @@ function safeErrorMessage(err: unknown, fallback: string): string {
 
 async function exchangeCode(code: string, verifier: string, redirectUri: string): Promise<CodexSession> {
   const revision = authRevision
-  const response = await fetch(CODEX_TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Accept: 'application/json'
-    },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: redirectUri,
-      client_id: CODEX_CLIENT_ID,
-      code_verifier: verifier
-    }).toString(),
-    signal: timeoutSignal()
-  })
+  const request = createRequestSignal()
+  try {
+    const response = await fetch(CODEX_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json'
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        client_id: CODEX_CLIENT_ID,
+        code_verifier: verifier
+      }).toString(),
+      signal: request.signal
+    })
 
-  if (!response.ok) throw new Error(`ChatGPT OAuth HTTP ${response.status}`)
-  const data = await response.json() as Record<string, unknown>
-  const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
-  const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : ''
-  if (!accessToken || !refreshToken) throw new Error('ChatGPT OAuth 未返回完整授权凭证')
+    throwIfAborted(request.signal)
+    if (!response.ok) throw new Error(`ChatGPT OAuth HTTP ${response.status}`)
+    const data = await readJson<Record<string, unknown>>(response, request.signal)
+    const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
+    const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : ''
+    if (!accessToken || !refreshToken) throw new Error('ChatGPT OAuth 未返回完整授权凭证')
 
-  const metadata = tokenMetadata(accessToken, typeof data.id_token === 'string' ? data.id_token : undefined)
-  const nextSession: CodexSession = {
-    accessToken,
-    refreshToken,
-    expiresAt: tokenExpiry(accessToken, data.expires_in),
-    ...metadata
+    const metadata = tokenMetadata(accessToken, typeof data.id_token === 'string' ? data.id_token : undefined)
+    const nextSession: CodexSession = {
+      accessToken,
+      refreshToken,
+      expiresAt: tokenExpiry(accessToken, data.expires_in),
+      ...metadata
+    }
+    if (revision !== authRevision) throw new Error('登录状态已变更，请重试')
+    writeStoredAuth({
+      refreshToken: nextSession.refreshToken,
+      accountId: nextSession.accountId,
+      email: nextSession.email
+    })
+    session = nextSession
+    return nextSession
+  } finally {
+    request.cleanup()
   }
-  if (revision !== authRevision) throw new Error('登录状态已变更，请重试')
-  writeStoredAuth({
-    refreshToken: nextSession.refreshToken,
-    accountId: nextSession.accountId,
-    email: nextSession.email
-  })
-  session = nextSession
-  return nextSession
 }
 
-async function refreshSession(source: StoredCodexAuth): Promise<CodexSession> {
+async function refreshSession(source: StoredCodexAuth, parentSignal?: AbortSignal): Promise<CodexSession> {
   const revision = authRevision
-  const response = await fetch(CODEX_TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json'
-    },
-    body: JSON.stringify({
-      client_id: CODEX_CLIENT_ID,
-      grant_type: 'refresh_token',
-      refresh_token: source.refreshToken
-    }),
-    signal: timeoutSignal()
-  })
+  const request = createRequestSignal(parentSignal)
+  try {
+    const response = await fetch(CODEX_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      body: JSON.stringify({
+        client_id: CODEX_CLIENT_ID,
+        grant_type: 'refresh_token',
+        refresh_token: source.refreshToken
+      }),
+      signal: request.signal
+    })
 
-  if (!response.ok) throw new Error('ChatGPT 授权已过期，请重新登录')
-  const data = await response.json() as Record<string, unknown>
-  const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
-  if (!accessToken) throw new Error('ChatGPT 刷新授权失败，请重新登录')
+    throwIfAborted(request.signal)
+    if (!response.ok) throw new Error('ChatGPT 授权已过期，请重新登录')
+    const data = await readJson<Record<string, unknown>>(response, request.signal)
+    const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
+    if (!accessToken) throw new Error('ChatGPT 刷新授权失败，请重新登录')
 
-  const metadata = tokenMetadata(accessToken, typeof data.id_token === 'string' ? data.id_token : undefined)
-  const nextSession: CodexSession = {
-    accessToken,
-    refreshToken: typeof data.refresh_token === 'string' && data.refresh_token ? data.refresh_token : source.refreshToken,
-    expiresAt: tokenExpiry(accessToken, data.expires_in),
-    accountId: metadata.accountId || source.accountId,
-    email: metadata.email || source.email
+    const metadata = tokenMetadata(accessToken, typeof data.id_token === 'string' ? data.id_token : undefined)
+    const nextSession: CodexSession = {
+      accessToken,
+      refreshToken: typeof data.refresh_token === 'string' && data.refresh_token ? data.refresh_token : source.refreshToken,
+      expiresAt: tokenExpiry(accessToken, data.expires_in),
+      accountId: metadata.accountId || source.accountId,
+      email: metadata.email || source.email
+    }
+    if (revision !== authRevision) throw new Error('登录状态已变更，请重试')
+    writeStoredAuth({
+      refreshToken: nextSession.refreshToken,
+      accountId: nextSession.accountId,
+      email: nextSession.email
+    })
+    session = nextSession
+    return nextSession
+  } finally {
+    request.cleanup()
   }
-  if (revision !== authRevision) throw new Error('登录状态已变更，请重试')
-  writeStoredAuth({
-    refreshToken: nextSession.refreshToken,
-    accountId: nextSession.accountId,
-    email: nextSession.email
-  })
-  session = nextSession
-  return nextSession
 }
 
-function refreshSessionOnce(source: StoredCodexAuth): Promise<CodexSession> {
+function refreshSessionOnce(source: StoredCodexAuth, parentSignal?: AbortSignal): Promise<CodexSession> {
   if (session && session.refreshToken !== source.refreshToken) {
     if (sessionIsUsable(session)) return Promise.resolve(session)
-    return refreshSessionOnce(session)
+    return refreshSessionOnce(session, parentSignal)
   }
   if (refreshInFlight?.refreshToken === source.refreshToken) return refreshInFlight.promise
 
-  const promise = refreshSession(source)
+  const promise = refreshSession(source, parentSignal)
   const pending = { refreshToken: source.refreshToken, promise }
   refreshInFlight = pending
   void promise.then(
@@ -270,23 +315,36 @@ function refreshSessionOnce(source: StoredCodexAuth): Promise<CodexSession> {
   return promise
 }
 
-async function ensureSession(stored: StoredCodexAuth): Promise<CodexSession> {
+async function ensureSession(stored: StoredCodexAuth, signal?: AbortSignal): Promise<CodexSession> {
+  throwIfAborted(signal)
   if (session && session.refreshToken === stored.refreshToken && sessionIsUsable(session)) return session
-  return refreshSessionOnce(session && session.refreshToken === stored.refreshToken ? session : stored)
+  return refreshSessionOnce(session && session.refreshToken === stored.refreshToken ? session : stored, signal)
 }
 
-async function requestUsage(current: CodexSession): Promise<Response> {
+async function requestUsage(current: CodexSession, parentSignal?: AbortSignal): Promise<{
+  response: Response
+  signal: AbortSignal
+  cleanup: () => void
+}> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${current.accessToken}`,
     Accept: 'application/json',
     'User-Agent': 'TokenMonitor'
   }
   if (current.accountId) headers['ChatGPT-Account-Id'] = current.accountId
-  return fetch(CODEX_USAGE_URL, {
-    method: 'GET',
-    headers,
-    signal: timeoutSignal()
-  })
+  const request = createRequestSignal(parentSignal)
+  try {
+    const response = await fetch(CODEX_USAGE_URL, {
+      method: 'GET',
+      headers,
+      signal: request.signal
+    })
+    throwIfAborted(request.signal)
+    return { response, signal: request.signal, cleanup: request.cleanup }
+  } catch (err) {
+    request.cleanup()
+    throw err
+  }
 }
 
 export function getCodexAuthStatus(): CodexAuthStatus {
@@ -299,44 +357,54 @@ export function getCodexAuthStatus(): CodexAuthStatus {
   }
 }
 
-export async function fetchCodexQuota(): Promise<CodexQuotaData> {
+export async function fetchCodexQuota(signal?: AbortSignal): Promise<CodexQuotaData> {
+  throwIfAborted(signal)
   const stored = readStoredAuth()
   if (!stored.auth) {
+    throwIfAborted(signal)
     return { configured: false, error: stored.error || null }
   }
 
   try {
-    let current = await ensureSession(stored.auth)
-    let response = await requestUsage(current)
+    let current = await ensureSession(stored.auth, signal)
+    let usageRequest = await requestUsage(current, signal)
 
-    if (response.status === 401) {
-      current = await refreshSessionOnce(current)
-      response = await requestUsage(current)
-    }
-
-    if (!response.ok) {
-      return {
-        configured: true,
-        email: current.email || stored.auth.email,
-        error: response.status === 403
-          ? 'ChatGPT 账号无权读取 Codex 额度'
-          : `Codex 额度接口 HTTP ${response.status}`
-      }
-    }
-
-    let payload: unknown
     try {
-      payload = await response.json()
-    } catch {
-      throw new Error('Codex 额度返回格式异常')
+      if (usageRequest.response.status === 401) {
+        usageRequest.cleanup()
+        current = await refreshSessionOnce(current, signal)
+        usageRequest = await requestUsage(current, signal)
+      }
+
+      const response = usageRequest.response
+      if (!response.ok) {
+        return {
+          configured: true,
+          email: current.email || stored.auth.email,
+          error: response.status === 403
+            ? 'ChatGPT 账号无权读取 Codex 额度'
+            : `Codex 额度接口 HTTP ${response.status}`
+        }
+      }
+
+      let payload: unknown
+      try {
+        payload = await readJson<unknown>(response, usageRequest.signal)
+      } catch {
+        throwIfAborted(signal)
+        throw new Error('Codex 额度返回格式异常')
+      }
+      const parsed = parseCodexUsage(payload, current.email || stored.auth.email)
+      return {
+        ...parsed,
+        configured: true,
+        error: parsed.error || null
+      }
+    } finally {
+      usageRequest.cleanup()
     }
-    const parsed = parseCodexUsage(payload, current.email || stored.auth.email)
-    return {
-      ...parsed,
-      configured: true,
-      error: parsed.error || null
-    }
-  } catch (err) {
+  } catch (err: unknown) {
+    throwIfAborted(signal)
     return {
       configured: true,
       email: session?.email || stored.auth.email,

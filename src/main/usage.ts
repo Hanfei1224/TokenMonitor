@@ -35,7 +35,19 @@ export interface MultiPlanUsageData {
 
 const OPENCODE_URL = 'https://opencode.ai/zen/go/v1/usage'
 
-export async function fetchOpenCodeUsage(apiKey?: string): Promise<OpenCodeUsageData> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error('请求已取消')
+}
+
+async function readJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  const data = await response.json() as T
+  throwIfAborted(signal)
+  return data
+}
+
+export async function fetchOpenCodeUsage(apiKey?: string, signal?: AbortSignal): Promise<OpenCodeUsageData> {
+  throwIfAborted(signal)
   if (!apiKey) {
     return { configured: false }
   }
@@ -48,9 +60,11 @@ export async function fetchOpenCodeUsage(apiKey?: string): Promise<OpenCodeUsage
         'x-api-key': apiKey,
         'Accept': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-      }
+      },
+      signal
     })
 
+    throwIfAborted(signal)
     if (!res.ok) {
       if (res.status === 401 || res.status === 403) {
         return { configured: true, error: 'API Key 无效或无权限' }
@@ -58,30 +72,37 @@ export async function fetchOpenCodeUsage(apiKey?: string): Promise<OpenCodeUsage
       return { configured: true, error: `HTTP ${res.status}` }
     }
 
-    const json = await res.json()
+    const json = await readJson<any>(res, signal)
     return {
       configured: true,
       usage: json.usage || json,
       error: null
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
+    throwIfAborted(signal)
     return {
       configured: true,
-      error: err.message || '网络异常'
+      error: err instanceof Error && err.message ? err.message : '网络异常'
     }
   }
 }
 
-export async function fetchMultiPlanUsage(cfg: AppConfig, todayStats?: any): Promise<MultiPlanUsageData> {
+export async function fetchMultiPlanUsage(
+  cfg: AppConfig,
+  todayStats?: any,
+  signal?: AbortSignal
+): Promise<MultiPlanUsageData> {
+  throwIfAborted(signal)
   const t0 = Date.now()
 
   const [opencode, deepseek, gemini, codex] = await Promise.all([
-    fetchOpenCodeUsage(cfg.opencodeApiKey || cfg.apiKey),
-    fetchDeepSeekBalance(cfg.deepseekApiKey || ''),
-    fetchGeminiQuota(cfg.geminiRefreshToken || '', cfg.geminiAccountEmail),
-    fetchCodexQuota()
+    fetchOpenCodeUsage(cfg.opencodeApiKey || cfg.apiKey, signal),
+    fetchDeepSeekBalance(cfg.deepseekApiKey || '', signal),
+    fetchGeminiQuota(cfg.geminiRefreshToken || '', cfg.geminiAccountEmail, signal),
+    fetchCodexQuota(signal)
   ])
 
+  throwIfAborted(signal)
   const latency = Date.now() - t0
 
   // 检查是否至少配置了一个通道

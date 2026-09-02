@@ -8,7 +8,7 @@ import { fetchMultiPlanUsage, MultiPlanUsageData } from './usage.js'
 import { startGoogleOAuth } from './geminiAuth.js'
 import { getCodexAuthStatus, logoutCodexOAuth, startCodexOAuth } from './codexAuth.js'
 import { createTray } from './tray.js'
-import { startStatsBackgroundScanner, getCachedTodayStats, getCachedMonthStats } from './stats.js'
+import { startStatsBackgroundScanner, stopStatsBackgroundScanner, getCachedTodayStats, getCachedMonthStats } from './stats.js'
 
 process.on('uncaughtException', (err) => {
   console.error('uncaughtException', err)
@@ -46,8 +46,9 @@ if (!hasSingleInstanceLock) {
 
 let mainWindow: BrowserWindow | null = null
 let calendarWindow: BrowserWindow | null = null
-let pollTimer: NodeJS.Timeout | null = null
-let pollGeneration = 0
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+let pollInFlight: Promise<void> | null = null
+let pollController: AbortController | null = null
 let statsScannerStarted = false
 let keepHidden = false
 let isQuitting = false
@@ -273,7 +274,7 @@ function createMainWindow() {
   try {
     createTray(mainWindow, {
       refresh: () => {
-        scheduleNextPoll()
+        void scheduleNextPoll()
       },
       openSettings: () => requestOverlay('settings')
     })
@@ -287,51 +288,63 @@ function createMainWindow() {
 const POLL_INTERVAL_MS = 60 * 1000
 const POLL_TIMEOUT_MS = 30 * 1000
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('用量请求超时')), timeoutMs)
-    promise.then(
-      (value) => {
-        clearTimeout(timer)
-        resolve(value)
-      },
-      (err) => {
-        clearTimeout(timer)
-        reject(err)
-      }
-    )
-  })
+function clearPollTimer(): void {
+  if (!pollTimer) return
+  clearTimeout(pollTimer)
+  pollTimer = null
 }
 
-async function scheduleNextPoll() {
-  if (pollTimer) {
-    clearTimeout(pollTimer)
-    pollTimer = null
-  }
+function scheduleNextPoll(): Promise<void> {
+  if (pollInFlight) return pollInFlight
+  clearPollTimer()
 
-  const generation = ++pollGeneration
+  const controller = new AbortController()
+  pollController = controller
   const startTime = Date.now()
-  try {
-    const cfg = loadConfig()
-    const todayStats = getCachedTodayStats()
-    const nextUsageData = await withTimeout(fetchMultiPlanUsage(cfg, todayStats), POLL_TIMEOUT_MS)
-    if (generation === pollGeneration) {
-      currentUsageData = nextUsageData
-      mainWindow?.webContents.send('usage-update', currentUsageData)
+  const timeoutTimer = setTimeout(() => {
+    controller.abort(new Error('用量请求超时'))
+  }, POLL_TIMEOUT_MS)
+
+  const promise = Promise.resolve().then(async () => {
+    try {
+      const cfg = loadConfig()
+      const todayStats = getCachedTodayStats()
+      const nextUsageData = await fetchMultiPlanUsage(cfg, todayStats, controller.signal)
+      if (!controller.signal.aborted) {
+        currentUsageData = nextUsageData
+        mainWindow?.webContents.send('usage-update', currentUsageData)
+      }
+    } catch (err) {
+      if (!isQuitting) console.error('Fetch multi plan usage error:', err)
+    } finally {
+      clearTimeout(timeoutTimer)
+      if (pollController === controller) pollController = null
+      pollInFlight = null
+
+      if (!isQuitting) {
+        // 以发出请求的时间为起点，计算等待 60 秒后的下一次时间点
+        const elapsed = Date.now() - startTime
+        const delay = Math.max(0, POLL_INTERVAL_MS - elapsed)
+        pollTimer = setTimeout(() => {
+          pollTimer = null
+          void scheduleNextPoll()
+        }, delay)
+      }
     }
-  } catch (err) {
-    console.error('Fetch multi plan usage error:', err)
-  } finally {
-    if (generation !== pollGeneration) return
-    // 以发出请求的时间为起点，计算等待 60 秒后的下一次时间点
-    const elapsed = Date.now() - startTime
-    const delay = Math.max(0, POLL_INTERVAL_MS - elapsed)
-    pollTimer = setTimeout(scheduleNextPoll, delay)
-  }
+  })
+  pollInFlight = promise
+  return promise
 }
 
 function startPolling() {
-  scheduleNextPoll()
+  void scheduleNextPoll()
+}
+
+function stopPolling(): void {
+  clearPollTimer()
+  const controller = pollController
+  pollController = null
+  controller?.abort(new Error('应用退出'))
 }
 
 ipcMain.handle('get-config', () => loadConfig())
@@ -451,6 +464,8 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   isQuitting = true
+  stopPolling()
+  stopStatsBackgroundScanner()
 })
 
 app.on('will-quit', () => {

@@ -21,22 +21,13 @@ function rawPreloadPlugin(): Plugin {
       }
       const workerSrc = path.resolve(__dirname, 'main/sqlite-worker.cjs')
       const workerDestDir = path.resolve(__dirname, 'dist-electron/main')
-      if (fs.existsSync(workerSrc)) {
-        if (!fs.existsSync(workerDestDir)) {
-          fs.mkdirSync(workerDestDir, { recursive: true })
-        }
-        fs.copyFileSync(workerSrc, path.join(workerDestDir, 'sqlite-worker.cjs'))
+      if (!fs.existsSync(workerSrc)) {
+        throw new Error(`[Vite] SQLite worker source not found: ${workerSrc}`)
       }
-
-      // 同步 sql.js 的 wasm 核心引擎至编译产物目录
-      const wasmSrc = path.resolve(__dirname, 'node_modules/sql.js/dist/sql-wasm.wasm')
-      if (fs.existsSync(wasmSrc)) {
-        if (!fs.existsSync(workerDestDir)) {
-          fs.mkdirSync(workerDestDir, { recursive: true })
-        }
-        fs.copyFileSync(wasmSrc, path.join(workerDestDir, 'sql-wasm.wasm'))
-        console.log('[Vite] Synced sql-wasm.wasm to dist-electron/main/sql-wasm.wasm')
+      if (!fs.existsSync(workerDestDir)) {
+        fs.mkdirSync(workerDestDir, { recursive: true })
       }
+      fs.copyFileSync(workerSrc, path.join(workerDestDir, 'sqlite-worker.cjs'))
     }
   }
 }
@@ -59,7 +50,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron/main',
             rollupOptions: {
-              external: ['electron', 'better-sqlite3', 'sql.js']
+              external: ['electron', 'better-sqlite3']
             }
           }
         }

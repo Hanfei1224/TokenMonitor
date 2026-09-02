@@ -1,5 +1,6 @@
 appId: com.token.monitor
 productName: TokenMonitor
+npmRebuild: false
 directories:
   output: ../release
 files:
@@ -10,7 +11,12 @@ files:
   - icon.png
 asarUnpack:
   - node_modules/better-sqlite3/**
-  - dist-electron/main/sql-wasm.wasm
+  - dist-electron/main/sqlite-worker.cjs
+extraResources:
+  - from: .tmp/node-runtime
+    to: node-runtime
+    filter:
+      - '**/*'
 win:
   executableName: TokenMonitor
   target:
