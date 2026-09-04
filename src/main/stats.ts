@@ -4,6 +4,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { app } from 'electron'
 import { getStorageDir } from './paths.js'
+import { parseCodexStatsLine } from './codexStats.js'
 import {
   cloneAggregateDays,
   createDayStats,
@@ -66,7 +67,7 @@ interface StatsCache {
   isScanning: boolean
 }
 
-const STATS_CACHE_VERSION = 3
+const STATS_CACHE_VERSION = 4
 
 const emptyBreakdown = (): UsageBreakdown => ({
   bySource: {},
@@ -578,34 +579,7 @@ function scanPiAggregateAsync(states: Record<string, JsonlFileState>) {
 }
 
 function scanCodexAggregateAsync(states: Record<string, JsonlFileState>) {
-  return scanJsonlRoot(path.join(os.homedir(), '.codex', 'sessions'), 'codex', states, (line) => {
-    if (!line.includes('"token_count"')) return null
-    try {
-      const j = JSON.parse(line)
-      const p = j.payload || {}
-      if (p.type !== 'token_count') return null
-      const u = p.info?.last_token_usage || {}
-      const total = Number(u.total_tokens || 0)
-      if (!total) return null
-      const ts = isoToMs(j.timestamp || '')
-      if (!ts) return null
-      const inp = Number(u.input_tokens || 0)
-      const cr = Number(u.cached_input_tokens || 0)
-      return {
-        ts,
-        total,
-        input: Math.max(0, inp - cr),
-        output: Number(u.output_tokens || 0),
-        cache_read: cr,
-        cache_write: 0,
-        source: 'codex',
-        provider: 'codex',
-        model: String(p.info?.model || 'codex')
-      }
-    } catch {
-      return null
-    }
-  })
+  return scanJsonlRoot(path.join(os.homedir(), '.codex', 'sessions'), 'codex', states, parseCodexStatsLine)
 }
 
 function statesForSource(states: Record<string, JsonlFileState>, source: JsonlSource): Record<string, JsonlFileState> {

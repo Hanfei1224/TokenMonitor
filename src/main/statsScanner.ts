@@ -17,6 +17,10 @@ export interface TokenStatsRow {
   estimated?: boolean
 }
 
+export interface JsonlParseContext {
+  model?: string
+}
+
 export interface DayStats {
   date: string
   total: number
@@ -40,6 +44,7 @@ export interface JsonlFileState {
   identity: string
   prefixHash: string
   offset: number
+  model?: string
   days: AggregateDays
 }
 
@@ -240,7 +245,7 @@ export async function scanJsonlRoot(
   root: string,
   source: JsonlSource,
   knownStates: Record<string, JsonlFileState>,
-  parseLine: (line: string) => TokenStatsRow | null
+  parseLine: (line: string, context: JsonlParseContext) => TokenStatsRow | null
 ): Promise<JsonlSourceScan> {
   const states: Record<string, JsonlFileState> = { ...knownStates }
   let complete = true
@@ -272,7 +277,8 @@ export async function scanJsonlRoot(
         const prefixHash = await hashFilePrefix(fullPath)
         const append = canAppendFile(stat, previous, prefixHash)
         const startOffset = append ? previous!.offset : 0
-        const result = await readJsonlFile(fullPath, startOffset, parseLine)
+        const context: JsonlParseContext = { model: append ? previous?.model : undefined }
+        const result = await readJsonlFile(fullPath, startOffset, (line) => parseLine(line, context))
         const finalStat = await fs.promises.stat(fullPath)
         if (result.nextOffset > finalStat.size) throw new Error('JSONL file was truncated while scanning')
 
@@ -285,6 +291,7 @@ export async function scanJsonlRoot(
           identity: fileIdentity(finalStat),
           prefixHash,
           offset: result.nextOffset,
+          ...(context.model ? { model: context.model } : {}),
           days
         }
       } catch {

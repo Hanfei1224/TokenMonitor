@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.1] - 2026-09-04
+
+### Fixed
+- 修复 Codex JSONL 统计无法关联具体模型，导致调用排行统一显示为 `codex` 的问题。
+- 修复同一会话切换模型或追加日志后，模型归类无法延续的问题；缓存升级后会自动重建历史统计。
+
 ## [1.4.0] - 2026-09-02
 
 ### Added
